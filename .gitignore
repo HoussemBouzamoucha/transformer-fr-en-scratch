@@ -1,0 +1,29 @@
+# Data and checkpoints
+data/raw/
+checkpoints/
+logs/
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+.env
+venv/
+.venv/
+
+# Jupyter
+.ipynb_checkpoints/
+notebooks/.ipynb_checkpoints/
+
+# VS Code
+.vscode/
+
+# CUDA build artifacts
+*.o
+*.so
+*.ptx
+
+# W&B
+wandb/

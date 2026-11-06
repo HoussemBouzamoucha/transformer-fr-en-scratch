@@ -1,0 +1,1 @@
+# shape + scale (sqrt d_model)

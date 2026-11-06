@@ -1,0 +1,1 @@
+# entry point → delegates to src/training/train.py
