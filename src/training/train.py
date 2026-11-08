@@ -1,6 +1,8 @@
 import sys
+import os
 from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent))
+os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 
 import torch
 from torch.utils.data import DataLoader
@@ -41,19 +43,19 @@ def train(config_path: str):
     collate = partial(collate_fn, pad_id=pad_id)
     train_loader = DataLoader(
         train_set,
-        batch_size=512,
+        batch_size=128,
         shuffle=True,
         collate_fn=collate,
-        num_workers=4,
+        num_workers=2,
         pin_memory=True,
         prefetch_factor=2,
     )
     val_loader = DataLoader(
         val_set,
-        batch_size=512,
+        batch_size=128,
         shuffle=False,
         collate_fn=collate,
-        num_workers=4,
+        num_workers=2,
         pin_memory=True,
         prefetch_factor=2,
     )
@@ -163,6 +165,5 @@ def train(config_path: str):
 
 
 if __name__ == "__main__":
-    import sys
     config = sys.argv[1] if len(sys.argv) > 1 else "configs/thin_slice.yaml"
     train(config)
