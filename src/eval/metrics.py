@@ -1,5 +1,4 @@
-# sacreBLEU, chrF, BPB, perplexityimport torch
-import sentencepiece as spm
+import torch
 import sacrebleu
 from tqdm import tqdm
 
@@ -21,7 +20,7 @@ def greedy_decode(model, src, bos_id, eos_id, device, max_len=100):
             if done.all():
                 break
 
-    return tgt[:, 1:]  # strip bos
+    return tgt[:, 1:]
 
 
 def decode_tokens(token_ids, sp, eos_id):
