@@ -13,7 +13,7 @@ def make_causal_mask(seq_len: int, device=None):
     """
     Returns: (1, 1, seq_len, seq_len) — upper triangle is 0 (blocked)
     """
-    mask = torch.tril(torch.ones(seq_len, seq_len, device=device))
+    mask = torch.tril(torch.ones(seq_len, seq_len, device=device)).bool()
     return mask.unsqueeze(0).unsqueeze(0)
 
 

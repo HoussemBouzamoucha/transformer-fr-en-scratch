@@ -1,4 +1,4 @@
-# Multi30K, 2/2/256seed: 42
+seed: 42
 
 data:
   name: multi30k
@@ -20,7 +20,7 @@ tokenizer:
   vocab_size: 8000
 
 training:
-  batch_tokens: 4096
+  batch_tokens: 8192
   warmup_steps: 400
   max_steps: 10000
   grad_clip: 1.0
@@ -28,6 +28,6 @@ training:
   fp16: true
 
 logging:
-  backend: tensorboard   # swap to wandb when ready
+  backend: tensorboard
   log_every: 50
   eval_every: 500

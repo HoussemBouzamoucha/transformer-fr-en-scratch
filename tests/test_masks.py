@@ -39,7 +39,7 @@ def test_causal_mask_values():
     expected = torch.tensor([[[[1, 0, 0, 0],
                                 [1, 1, 0, 0],
                                 [1, 1, 1, 0],
-                                [1, 1, 1, 1]]]], dtype=torch.float32)
+                                [1, 1, 1, 1]]]], dtype=torch.bool)
     assert torch.equal(mask, expected)
     print("  causal mask values: OK")
 
