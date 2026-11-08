@@ -6,6 +6,7 @@ data:
   max_tokens: 100
   data_dir: data/raw/wmt14
   sp_model: data/vocab/spm_8k_wmt.model
+  max_train_pairs: 200000
 
 model:
   d_model: 256

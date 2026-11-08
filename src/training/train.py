@@ -36,10 +36,9 @@ def train(config_path: str):
 
     # Data
     data_dir = cfg["data"].get("data_dir", f"data/raw/{cfg['data']['name']}")
-
-    train_set = Multi30KDataset("train", data_dir, sp_model, max_len=cfg["data"]["max_tokens"])
+    max_pairs = cfg["data"].get("max_train_pairs", None)
+    train_set = Multi30KDataset("train", data_dir, sp_model, max_len=cfg["data"]["max_tokens"], max_pairs=max_pairs)
     val_set   = Multi30KDataset("val",   data_dir, sp_model, max_len=cfg["data"]["max_tokens"])
-
     collate = partial(collate_fn, pad_id=pad_id)
     train_loader = DataLoader(
         train_set,

@@ -5,7 +5,8 @@ import sentencepiece as spm
 
 
 class Multi30KDataset(Dataset):
-    def __init__(self, split: str, data_dir: str, sp_model_path: str, max_len: int = 128):
+    def __init__(self, split: str, data_dir: str, sp_model_path: str,
+                 max_len: int = 128, max_pairs: int = None):
         data_dir = Path(data_dir)
         self.max_len = max_len
 
@@ -29,6 +30,9 @@ class Multi30KDataset(Dataset):
         self.pairs = []
         skipped = 0
         for fr, en in zip(fr_lines, en_lines):
+            if max_pairs and len(self.pairs) >= max_pairs:
+                break
+
             fr_ids = [self.bos_id] + self.sp.encode(fr) + [self.eos_id]
             en_ids = [self.bos_id] + self.sp.encode(en) + [self.eos_id]
 
