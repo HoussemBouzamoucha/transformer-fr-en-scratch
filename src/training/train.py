@@ -1,10 +1,8 @@
-# main training loopimport sys
-from pathlib import Path
 import sys
+from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent))
 
 import torch
-import torch.nn as nn
 from torch.utils.data import DataLoader
 from functools import partial
 import sentencepiece as spm
@@ -23,23 +21,43 @@ def train(config_path: str):
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Device: {device}")
+
     if device.type == "cuda":
         torch.cuda.set_per_process_memory_fraction(0.95)
+        print(f"GPU: {torch.cuda.get_device_name(0)}")
 
     # Tokenizer
+    sp_model = cfg["data"].get("sp_model", "data/vocab/spm_8k_wmt.model")
     sp = spm.SentencePieceProcessor()
-    sp.load("data/vocab/spm_8k.model")
+    sp.load(sp_model)
     pad_id = sp.piece_to_id("<pad>")
 
     # Data
-    train_set = Multi30KDataset("train", "data/raw/multi30k", "data/vocab/spm_8k.model",
-                                max_len=cfg["data"]["max_tokens"])
-    val_set   = Multi30KDataset("val",   "data/raw/multi30k", "data/vocab/spm_8k.model",
-                                max_len=cfg["data"]["max_tokens"])
+    data_dir = cfg["data"].get("data_dir", f"data/raw/{cfg['data']['name']}")
+
+    train_set = Multi30KDataset("train", data_dir, sp_model, max_len=cfg["data"]["max_tokens"])
+    val_set   = Multi30KDataset("val",   data_dir, sp_model, max_len=cfg["data"]["max_tokens"])
 
     collate = partial(collate_fn, pad_id=pad_id)
-    train_loader = DataLoader(train_set, batch_size=128, shuffle=True,  collate_fn=collate)
-    val_loader   = DataLoader(val_set,   batch_size=128, shuffle=False, collate_fn=collate)
+    train_loader = DataLoader(
+        train_set,
+        batch_size=512,
+        shuffle=True,
+        collate_fn=collate,
+        num_workers=4,
+        pin_memory=True,
+        prefetch_factor=2,
+    )
+    val_loader = DataLoader(
+        val_set,
+        batch_size=512,
+        shuffle=False,
+        collate_fn=collate,
+        num_workers=4,
+        pin_memory=True,
+        prefetch_factor=2,
+    )
+
     # Model
     m = cfg["model"]
     model = Transformer(
@@ -58,32 +76,36 @@ def train(config_path: str):
     print(f"Parameters: {n_params:,}")
 
     # Loss, optimizer, scheduler
-    criterion = LabelSmoothedCrossEntropy(cfg["tokenizer"]["vocab_size"],
-                                          cfg["training"]["label_smoothing"], pad_id)
+    criterion = LabelSmoothedCrossEntropy(
+        cfg["tokenizer"]["vocab_size"],
+        cfg["training"]["label_smoothing"],
+        pad_id
+    )
     optimizer = torch.optim.Adam(model.parameters(), betas=(0.9, 0.98), eps=1e-9)
     scheduler = InverseSqrtScheduler(optimizer, m["d_model"], cfg["training"]["warmup_steps"])
-    scaler = torch.amp.GradScaler('cuda', enabled=cfg["training"]["fp16"] and device.type == "cuda")
+    scaler    = torch.amp.GradScaler('cuda', enabled=cfg["training"]["fp16"] and device.type == "cuda")
 
-    # Training loop
     best_val_loss = float("inf")
     step = 0
 
-    for epoch in range(1, 51):
+    for epoch in range(1, 1000):
         model.train()
         total_loss = 0.0
         total_tokens = 0
 
         for src, tgt in tqdm(train_loader, desc=f"Epoch {epoch}"):
-            src = src.to(device)
-            tgt = tgt.to(device)
+            src = src.to(device, non_blocking=True)
+            tgt = tgt.to(device, non_blocking=True)
             tgt_in  = tgt[:, :-1]
             tgt_out = tgt[:, 1:]
 
             optimizer.zero_grad()
             with torch.amp.autocast('cuda', enabled=cfg["training"]["fp16"] and device.type == "cuda"):
                 logits = model(src, tgt_in)
-                loss = criterion(logits.reshape(-1, cfg["tokenizer"]["vocab_size"]),
-                                 tgt_out.reshape(-1))
+                loss = criterion(
+                    logits.reshape(-1, cfg["tokenizer"]["vocab_size"]),
+                    tgt_out.reshape(-1)
+                )
 
             scaler.scale(loss).backward()
             scaler.unscale_(optimizer)
@@ -105,23 +127,24 @@ def train(config_path: str):
         val_tokens = 0
         with torch.no_grad():
             for src, tgt in val_loader:
-                src = src.to(device)
-                tgt = tgt.to(device)
+                src = src.to(device, non_blocking=True)
+                tgt = tgt.to(device, non_blocking=True)
                 tgt_in  = tgt[:, :-1]
                 tgt_out = tgt[:, 1:]
-                with torch.cuda.amp.autocast(enabled=cfg["training"]["fp16"] and device.type == "cuda"):
+                with torch.amp.autocast('cuda', enabled=cfg["training"]["fp16"] and device.type == "cuda"):
                     logits = model(src, tgt_in)
-                    loss = criterion(logits.reshape(-1, cfg["tokenizer"]["vocab_size"]),
-                                     tgt_out.reshape(-1))
+                    loss = criterion(
+                        logits.reshape(-1, cfg["tokenizer"]["vocab_size"]),
+                        tgt_out.reshape(-1)
+                    )
                 n_tokens = (tgt_out != pad_id).sum().item()
                 val_loss   += loss.item() * n_tokens
                 val_tokens += n_tokens
 
         val_loss /= val_tokens
-        print(f"Epoch {epoch:2d} | step {step:5d} | lr {scheduler.get_lr():.6f} "
+        print(f"Epoch {epoch:2d} | step {step:6d} | lr {scheduler.get_lr():.6f} "
               f"| train loss {train_loss:.4f} | val loss {val_loss:.4f}")
 
-        # Checkpoint
         if val_loss < best_val_loss:
             best_val_loss = val_loss
             Path("checkpoints").mkdir(exist_ok=True)
@@ -140,4 +163,6 @@ def train(config_path: str):
 
 
 if __name__ == "__main__":
-    train("configs/thin_slice.yaml")
+    import sys
+    config = sys.argv[1] if len(sys.argv) > 1 else "configs/thin_slice.yaml"
+    train(config)
