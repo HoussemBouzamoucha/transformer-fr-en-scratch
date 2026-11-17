@@ -10,13 +10,13 @@ Afterwards it prints how much each vocab threshold lengthens validation sentence
 to choose tokenizer.vocab_threshold in the config.
 """
 import argparse
-import random
 import sys
 import time
 from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from src.tokenizer.bpe import BPETokenizer
+from src.tokenizer.sampling import sample_pairs
 
 parser = argparse.ArgumentParser()
 parser.add_argument("--data-dir", default="data/raw/multi30k")
@@ -36,18 +36,8 @@ data_dir = Path(args.data_dir)
 out_path = Path(args.out)
 out_path.parent.mkdir(parents=True, exist_ok=True)
 
-# Reservoir-sample pairs in one pass (works for multi-million-line files).
-rng = random.Random(args.seed)
-sample, n = [], 0
-with open(data_dir / "train.fr", encoding="utf-8") as f, open(data_dir / "train.en", encoding="utf-8") as e:
-    for n, (fr, en) in enumerate(zip(f, e), 1):
-        if len(sample) < args.sample_size:
-            sample.append((fr.strip(), en.strip()))
-        else:
-            j = rng.randrange(n)
-            if j < args.sample_size:
-                sample[j] = (fr.strip(), en.strip())
-corpora = {"fr": [p[0] for p in sample], "en": [p[1] for p in sample]}
+corpora, n = sample_pairs(data_dir, args.sample_size, args.seed)
+sample = corpora["fr"]
 print(f"Sampled {len(sample):,} of {n:,} pairs from {data_dir}")
 
 print(f"\nTraining joint BPE (vocab_size={args.vocab_size})...")

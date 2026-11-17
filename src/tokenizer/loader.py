@@ -45,6 +45,34 @@ class SentencePieceTokenizer:
                 "vocab_size": self.vocab_size}
 
 
+class HFTokenizer:
+    """A HuggingFace `tokenizers` file (tokenizer.json), e.g. the retrained GPT-2 byte-level BPE."""
+    kind = "hf"
+
+    def __init__(self, path: str):
+        from tokenizers import Tokenizer  # only needed for this backend
+        self.path = path
+        self.tok = Tokenizer.from_file(path)
+        self.pad_id = self.tok.token_to_id("<pad>")
+        self.bos_id = self.tok.token_to_id("<s>")
+        self.eos_id = self.tok.token_to_id("</s>")
+        self.vocab_size = self.tok.get_vocab_size()
+        self.threshold = 0
+
+    def encode(self, text: str, lang=None):
+        return self.tok.encode(text, add_special_tokens=False).ids
+
+    def decode(self, ids):
+        return self.tok.decode(ids, skip_special_tokens=True)
+
+    def target_token_ids(self, lang="en"):
+        return None
+
+    def fingerprint(self):
+        return {"type": self.kind, "path": str(self.path), "sha256": _sha256(self.path),
+                "vocab_size": self.vocab_size}
+
+
 class JointBPETokenizer:
     """Wraps BPETokenizer with the per-language vocabulary threshold from the config."""
     kind = "bpe"
@@ -83,7 +111,9 @@ def load_tokenizer(cfg: dict):
     if kind == "sentencepiece":
         path = tok_cfg.get("path") or cfg["data"].get("sp_model", "data/vocab/spm_8k_wmt.model")
         return SentencePieceTokenizer(path)
-    raise ValueError(f"Unknown tokenizer type: {kind!r} (expected 'bpe' or 'sentencepiece')")
+    if kind == "hf":
+        return HFTokenizer(tok_cfg["path"])
+    raise ValueError(f"Unknown tokenizer type: {kind!r} (expected 'bpe', 'sentencepiece' or 'hf')")
 
 
 def check_fingerprint(saved: dict, tokenizer):
