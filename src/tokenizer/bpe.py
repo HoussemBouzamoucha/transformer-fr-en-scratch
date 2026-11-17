@@ -6,14 +6,23 @@ undo merges that were (almost) only ever seen in the *other* language, which is
 the "vocabulary threshold" trick from subword-nmt.
 """
 import json
+import re
 from collections import Counter, defaultdict
 from heapq import heapify, heappop, heappush
+
+# Letters/digits stay together; every other non-space character is its own piece.
+_PIECE_RE = re.compile(r"\w+|[^\w\s]")
 
 
 class BPETokenizer:
     EOW = "</w>"
+    # Join mark for pre-tokenization: on a punctuation piece, "⁐." means "no space
+    # before me" and "'⁐" means "no space after me". Word pieces never carry it, so
+    # "fenêtre" is the same token in "fenêtre." and "fenêtre ouverte".
+    GLUE = "⁐"
 
-    def __init__(self):
+    def __init__(self, pretokenize: bool = True):
+        self.pretokenize = pretokenize
         self.merges = []          # ordered list of (a, b); index = merge rank
         self.merge_ranks = {}     # (a, b) -> rank
         self.split_of = {}        # merged token -> (a, b) that first produced it
@@ -48,12 +57,46 @@ class BPETokenizer:
     def piece_to_id(self, piece):
         return self.vocab.get(piece, self.unk_id)
 
+    # ------------------------------------------------------- pre-tokenizing
+    def _pieces(self, word):
+        """Split one whitespace-delimited word into BPE input pieces.
+
+        Each boundary inside the word gets one GLUE mark, on the punctuation side:
+        suffix of the left piece if it is punctuation, else prefix of the right one.
+        """
+        if not self.pretokenize:
+            return [word]
+        word = word.replace(self.GLUE, "")
+        parts = _PIECE_RE.findall(word)
+        if len(parts) <= 1:
+            return parts or [word]
+        out = list(parts)
+        for i in range(len(parts) - 1):
+            left_is_punct = not (parts[i][0].isalnum() or parts[i][0] == "_")
+            if left_is_punct:
+                out[i] = out[i] + self.GLUE
+            else:
+                out[i + 1] = self.GLUE + out[i + 1]
+        return out
+
+    def _join(self, text):
+        """Inverse of _pieces over a whole decoded string ("a</w>⁐.</w>" -> "a.")."""
+        pieces = [p for p in text.split(self.EOW)]
+        if pieces and pieces[-1] == "":
+            pieces.pop()
+        out = []
+        for i, p in enumerate(pieces):
+            if i > 0 and not (pieces[i - 1].endswith(self.GLUE) or p.startswith(self.GLUE)):
+                out.append(" ")
+            out.append(p)
+        return "".join(out).replace(self.GLUE, "").strip()
+
     # ------------------------------------------------------------- training
-    @staticmethod
-    def _word_counts(texts):
+    def _word_counts(self, texts):
         counts = Counter()
         for text in texts:
-            counts.update(text.split())
+            for word in text.split():
+                counts.update(self._pieces(word))
         return counts
 
     def train(self, corpora, vocab_size: int, verbose: bool = False):
@@ -202,14 +245,14 @@ class BPETokenizer:
         tokens = []
         for word in text.split():
             key = (word, lang, threshold)
-            pieces = self._cache.get(key)
-            if pieces is None:
-                pieces = self._segment(word)
+            toks = self._cache.get(key)
+            if toks is None:
+                toks = [t for piece in self._pieces(word) for t in self._segment(piece)]
                 if allowed is not None:
-                    pieces = [p for tok in pieces for p in self._split_rare(tok, allowed)]
+                    toks = [p for tok in toks for p in self._split_rare(tok, allowed)]
                 if len(self._cache) < 500_000:
-                    self._cache[key] = pieces
-            tokens.extend(pieces)
+                    self._cache[key] = toks
+            tokens.extend(toks)
         return tokens
 
     def encode(self, text: str, lang=None, threshold: int = 0, add_special: bool = False):
@@ -223,12 +266,15 @@ class BPETokenizer:
     def decode(self, ids):
         skip = {self.pad_id, self.bos_id, self.eos_id}
         text = "".join(self.id_to_token.get(i, "<unk>") for i in ids if i not in skip)
+        if self.pretokenize:
+            return self._join(text)
         return text.replace(self.EOW, " ").strip()
 
     # ---------------------------------------------------------- persistence
     def save(self, path: str):
         data = {
             "version": 2,
+            "pretokenize": self.pretokenize,
             "special_tokens": self.special_tokens,
             "merges": [list(p) for p in self.merges],
             "vocab": self.vocab,
@@ -243,6 +289,8 @@ class BPETokenizer:
             data = json.load(f)
         self.vocab = data["vocab"]
         self.special_tokens = data.get("special_tokens", self.special_tokens)
+        # Files trained before pre-tokenization existed must keep the old behaviour.
+        self.pretokenize = data.get("pretokenize", False)
         if data.get("version", 1) >= 2:
             self.merges = [tuple(p) for p in data["merges"]]
         else:  # v1 files stored [[a, b], merged]; JSON lists keep merge order

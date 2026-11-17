@@ -50,6 +50,40 @@ def test_vocab_threshold_splits_other_language_tokens():
     assert bpe.tokenize("the", lang="en", threshold=1) == ["the</w>"]
 
 
+def test_punctuation_is_split_off_words():
+    bpe = BPETokenizer()
+    bpe.train({"fr": ["le chat mange. le chat dort, le chat"] * 20,
+               "en": ["the cat eats. the cat sleeps, the cat"] * 20}, vocab_size=80)
+    # "chat" is the same token whether or not punctuation follows it.
+    assert bpe.tokenize("chat.")[0] == bpe.tokenize("chat")[0] == "chat</w>"
+    assert bpe.tokenize("chat.") == ["chat</w>", bpe.GLUE + ".</w>"]
+
+
+def test_pieces_put_glue_on_punctuation_side():
+    bpe, g = BPETokenizer(), BPETokenizer.GLUE
+    assert bpe._pieces("fenêtre.") == ["fenêtre", g + "."]
+    assert bpe._pieces("l'herbe") == ["l", g + "'" + g, "herbe"]
+    assert bpe._pieces('"Hello."') == ['"' + g, "Hello", g + "." + g, '"']
+    assert bpe._pieces("volley-ball") == ["volley", g + "-" + g, "ball"]
+    assert bpe._pieces("chat") == ["chat"]
+
+
+def test_punctuation_roundtrip_is_exact():
+    bpe = BPETokenizer()
+    bpe.train({"fr": FR + ["l'herbe verte. \"Le chat,\" dit-il... c?!"] * 5,
+               "en": EN + ["the cat's 2 dogs! a -- b"] * 5}, vocab_size=80)
+    for text in ["l'herbe verte.", '"Le chat," dit-il.', "the cat's 2 dogs!", "a -- b ... c?!"]:
+        assert bpe.decode(bpe.encode(text)) == text, text
+
+
+def test_old_files_load_without_pretokenize(tmp_path):
+    bpe = BPETokenizer(pretokenize=False)
+    bpe.train({"fr": FR, "en": EN}, vocab_size=60)
+    path = tmp_path / "old.json"
+    bpe.save(str(path))
+    assert BPETokenizer().load(str(path)).pretokenize is False
+
+
 def test_add_special():
     bpe = _trained()
     ids = bpe.encode("le chat", add_special=True)
