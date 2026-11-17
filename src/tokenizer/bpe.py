@@ -1,34 +1,60 @@
-"""Joint BPE tokenizer (Sennrich et al., 2016) for a shared FR/EN vocabulary.
+"""Joint BPE tokenizer (Sennrich et al., 2016) for French -> English translation.
 
 One set of merges and one vocabulary are learned from both languages together.
-Each language also keeps its own token counts. At encode time those counts can
-undo merges that were (almost) only ever seen in the *other* language, which is
-the "vocabulary threshold" trick from subword-nmt.
+Each language also keeps its own token counts, which are used to
+  - undo merges seen (almost) only in the other language when encoding
+    (the "vocabulary threshold" from subword-nmt), and
+  - restrict which tokens the decoder may generate (target_token_ids).
+
+Pipeline for one sentence:
+  normalize (NFC, quotes, spaces)  ->  split on whitespace
+  -> pre-tokenize each word (punctuation off, language-aware apostrophes, join marks)
+  -> BPE merges by rank  ->  optional per-language threshold split
 """
 import json
 import re
 from collections import Counter, defaultdict
 from heapq import heapify, heappop, heappush
 
+from src.tokenizer.normalize import normalize as normalize_text
+
 # Letters/digits stay together; every other non-space character is its own piece.
 _PIECE_RE = re.compile(r"\w+|[^\w\s]")
+
+# Never mapped to <unk>, however rare: ASCII printable, Latin-1 (ñ ° £ § ...),
+# the French letters outside Latin-1 (œ Œ Ÿ) and €.
+ALWAYS_KEEP = (set(chr(c) for c in range(0x20, 0x7F)) | set(chr(c) for c in range(0xA1, 0x100))
+               | set("œŒŸ€"))
+ALWAYS_KEEP.discard("­")  # soft hyphen (normalize() removes it anyway)
+
+PRETOKENIZE_VERSION = 2  # 0 = whitespace only; 1 = first punctuation rules (retired)
+
+
+def _wordchar(c):
+    return c.isalnum() or c == "_"
+
+
+def _is_word(piece):
+    return _wordchar(piece[0]) and _wordchar(piece[-1])
 
 
 class BPETokenizer:
     EOW = "</w>"
-    # Join mark for pre-tokenization: on a punctuation piece, "⁐." means "no space
-    # before me" and "'⁐" means "no space after me". Word pieces never carry it, so
-    # "fenêtre" is the same token in "fenêtre." and "fenêtre ouverte".
+    # Join mark: "⁐." = no space before this punctuation, "l'⁐" = no space after.
+    # Each boundary inside a word gets exactly one mark, and word pieces never
+    # carry one, so "fenêtre" is the same token in "fenêtre." and "fenêtre ouverte".
     GLUE = "⁐"
 
-    def __init__(self, pretokenize: bool = True):
-        self.pretokenize = pretokenize
+    def __init__(self, pretokenize: int = PRETOKENIZE_VERSION, normalize: bool = True):
+        self.pretokenize = int(pretokenize)
+        self.normalize = normalize
+        self.min_char_count = 1
         self.merges = []          # ordered list of (a, b); index = merge rank
         self.merge_ranks = {}     # (a, b) -> rank
         self.split_of = {}        # merged token -> (a, b) that first produced it
         self.vocab = {}           # token -> id
         self.id_to_token = {}     # id -> token
-        self.base_tokens = set()  # single characters + </w>; never split further
+        self.base_tokens = set()  # kept characters + </w>; never split further
         self.lang_counts = {}     # lang -> {token: count in that language}
         self.special_tokens = ["<pad>", "<unk>", "<s>", "</s>"]
         self._cache = {}
@@ -58,30 +84,50 @@ class BPETokenizer:
         return self.vocab.get(piece, self.unk_id)
 
     # ------------------------------------------------------- pre-tokenizing
-    def _pieces(self, word):
-        """Split one whitespace-delimited word into BPE input pieces.
+    def _clean(self, text):
+        return normalize_text(text) if self.normalize else text
 
-        Each boundary inside the word gets one GLUE mark, on the punctuation side:
-        suffix of the left piece if it is punctuation, else prefix of the right one.
-        """
-        if not self.pretokenize:
+    def _pieces(self, word, lang=None):
+        """Split one whitespace-delimited word into BPE input pieces."""
+        if self.pretokenize == 0:
             return [word]
-        word = word.replace(self.GLUE, "")
-        parts = _PIECE_RE.findall(word)
+        parts = _PIECE_RE.findall(word.replace(self.GLUE, ""))
         if len(parts) <= 1:
-            return parts or [word]
+            return parts
+
+        # Apostrophe between two words: French elision keeps it on the left
+        # ("l'" "herbe", "qu'" "il"); English clitics keep it on the right
+        # ("man" "'s", "don" "'t"). Unknown language: leave it standalone.
+        if lang in ("fr", "en"):
+            merged, i = [], 0
+            while i < len(parts):
+                p = parts[i]
+                if (p == "'" and merged and _is_word(merged[-1])
+                        and i + 1 < len(parts) and _is_word(parts[i + 1])):
+                    if lang == "fr":
+                        merged[-1] += "'"
+                        i += 1
+                    else:
+                        merged.append("'" + parts[i + 1])
+                        i += 2
+                    continue
+                merged.append(p)
+                i += 1
+            parts = merged
+
+        # One join mark per boundary, on the right piece when it starts with
+        # punctuation, otherwise on the left piece (which then ends with it).
         out = list(parts)
         for i in range(len(parts) - 1):
-            left_is_punct = not (parts[i][0].isalnum() or parts[i][0] == "_")
-            if left_is_punct:
-                out[i] = out[i] + self.GLUE
-            else:
+            if not _wordchar(parts[i + 1][0]):
                 out[i + 1] = self.GLUE + out[i + 1]
+            else:
+                out[i] = out[i] + self.GLUE
         return out
 
     def _join(self, text):
-        """Inverse of _pieces over a whole decoded string ("a</w>⁐.</w>" -> "a.")."""
-        pieces = [p for p in text.split(self.EOW)]
+        """Inverse of _pieces over a decoded string ("a</w>⁐.</w>" -> "a.")."""
+        pieces = text.split(self.EOW)
         if pieces and pieces[-1] == "":
             pieces.pop()
         out = []
@@ -92,42 +138,56 @@ class BPETokenizer:
         return "".join(out).replace(self.GLUE, "").strip()
 
     # ------------------------------------------------------------- training
-    def _word_counts(self, texts):
+    def _piece_counts(self, texts, lang):
         counts = Counter()
         for text in texts:
-            for word in text.split():
-                counts.update(self._pieces(word))
+            for word in self._clean(text).split():
+                counts.update(self._pieces(word, lang))
         return counts
 
-    def train(self, corpora, vocab_size: int, verbose: bool = False):
+    def train(self, corpora, vocab_size: int, min_char_count: int = 1, verbose: bool = False):
         """Learn joint merges.
 
         corpora: {"fr": [lines], "en": [lines]} (or a plain list of lines, which
-        trains a joint vocab without per-language counts).
+        trains without per-language counts).
+        min_char_count: characters seen fewer times (and not in ALWAYS_KEEP) get
+        no vocab entry and encode as <unk>, so web-text junk doesn't use up slots.
         """
         if not isinstance(corpora, dict):
             corpora = {None: list(corpora)}
+        self.min_char_count = min_char_count
 
-        lang_words = {lang: self._word_counts(lines) for lang, lines in corpora.items()}
+        lang_pieces = {lang: self._piece_counts(lines, lang) for lang, lines in corpora.items()}
         joint = Counter()
-        for counts in lang_words.values():
+        for counts in lang_pieces.values():
             joint.update(counts)
 
-        # Each unique word as a mutable list of symbols, plus its frequency.
+        char_counts = Counter()
+        for piece, f in joint.items():
+            for ch in piece:
+                char_counts[ch] += f
+        rare = {ch for ch, c in char_counts.items() if c < min_char_count and ch not in ALWAYS_KEEP}
+
+        # Each unique piece as a mutable list of symbols, plus its frequency.
         words = [list(w) + [self.EOW] for w in joint]
         freqs = list(joint.values())
 
         self.vocab = {tok: i for i, tok in enumerate(self.special_tokens)}
-        self.base_tokens = {sym for w in words for sym in w}
+        # ALWAYS_KEEP characters get an entry even if this sample never had them,
+        # so ordinary punctuation, digits and accents never become <unk>.
+        self.base_tokens = ({sym for w in words for sym in w} - rare) | (ALWAYS_KEEP - {" "})
         for sym in sorted(self.base_tokens):
             self.vocab.setdefault(sym, len(self.vocab))
+
+        def pairs_of(w):
+            return [p for p in zip(w, w[1:]) if p[0] not in rare and p[1] not in rare]
 
         # Pair counts + which words contain each pair, updated incrementally
         # instead of recounting the whole corpus after every merge.
         pair_counts = defaultdict(int)
         where = defaultdict(set)
         for wi, w in enumerate(words):
-            for pair in zip(w, w[1:]):
+            for pair in pairs_of(w):
                 pair_counts[pair] += freqs[wi]
                 where[pair].add(wi)
 
@@ -155,7 +215,7 @@ class BPETokenizer:
             changed = set()
             for wi in list(where[pair]):
                 w, f = words[wi], freqs[wi]
-                for p in zip(w, w[1:]):
+                for p in pairs_of(w):
                     pair_counts[p] -= f
                     changed.add(p)
                 new_w, i = [], 0
@@ -167,7 +227,7 @@ class BPETokenizer:
                         new_w.append(w[i])
                         i += 1
                 words[wi] = new_w
-                for p in zip(new_w, new_w[1:]):
+                for p in pairs_of(new_w):
                     pair_counts[p] += f
                     where[p].add(wi)
                     changed.add(p)
@@ -188,16 +248,18 @@ class BPETokenizer:
 
         # Per-language token counts under the final segmentation.
         self.lang_counts = {}
-        for lang, counts in lang_words.items():
+        for lang, counts in lang_pieces.items():
             if lang is None:
                 continue
             tc = Counter()
-            for word, f in counts.items():
-                for tok in self._segment(word):
-                    tc[tok] += f
+            for piece, f in counts.items():
+                for tok in self._segment(piece):
+                    if tok in self.vocab:
+                        tc[tok] += f
             self.lang_counts[lang] = dict(tc)
 
-        print(f"Training done. Vocab size: {len(self.vocab)}, merges: {len(self.merges)}")
+        print(f"Training done. Vocab size: {len(self.vocab)}, merges: {len(self.merges)}, "
+              f"rare chars -> <unk>: {len(rare)}")
 
     def _finalize(self):
         self.merge_ranks = {pair: r for r, pair in enumerate(self.merges)}
@@ -205,9 +267,9 @@ class BPETokenizer:
         self._cache = {}
 
     # ------------------------------------------------------------- encoding
-    def _segment(self, word):
+    def _segment(self, piece):
         """Apply merges by rank (lowest first), like the original BPE."""
-        syms = list(word) + [self.EOW]
+        syms = list(piece) + [self.EOW]
         ranks = self.merge_ranks
         while len(syms) > 1:
             best_rank = None
@@ -230,6 +292,11 @@ class BPETokenizer:
             syms = out
         return syms
 
+    def _allowed(self, lang, threshold):
+        if lang is None or threshold <= 0 or lang not in self.lang_counts:
+            return None
+        return {t for t, c in self.lang_counts[lang].items() if c >= threshold}
+
     def _split_rare(self, tok, allowed):
         """Undo merges until every piece is frequent enough in this language."""
         if tok in allowed or tok in self.base_tokens or tok not in self.split_of:
@@ -238,16 +305,13 @@ class BPETokenizer:
         return self._split_rare(a, allowed) + self._split_rare(b, allowed)
 
     def tokenize(self, text: str, lang=None, threshold: int = 0):
-        allowed = None
-        if lang is not None and threshold > 0 and lang in self.lang_counts:
-            allowed = {t for t, c in self.lang_counts[lang].items() if c >= threshold}
-
+        allowed = self._allowed(lang, threshold)
         tokens = []
-        for word in text.split():
+        for word in self._clean(text).split():
             key = (word, lang, threshold)
             toks = self._cache.get(key)
             if toks is None:
-                toks = [t for piece in self._pieces(word) for t in self._segment(piece)]
+                toks = [t for piece in self._pieces(word, lang) for t in self._segment(piece)]
                 if allowed is not None:
                     toks = [p for tok in toks for p in self._split_rare(tok, allowed)]
                 if len(self._cache) < 500_000:
@@ -270,11 +334,25 @@ class BPETokenizer:
             return self._join(text)
         return text.replace(self.EOW, " ").strip()
 
+    def target_token_ids(self, lang: str = "en", threshold: int = 0):
+        """Ids the decoder may emit for `lang`: tokens seen there (>= threshold
+        times), every base character, </s> and <unk>. Everything a training
+        target encoded with the same lang/threshold can contain is included."""
+        if lang not in self.lang_counts:
+            return None
+        allowed = self._allowed(lang, max(threshold, 1))
+        ids = {self.vocab[t] for t in allowed if t in self.vocab}
+        ids |= {self.vocab[t] for t in self.base_tokens}
+        ids |= {self.eos_id, self.unk_id}
+        return sorted(ids)
+
     # ---------------------------------------------------------- persistence
     def save(self, path: str):
         data = {
-            "version": 2,
+            "version": 3,
             "pretokenize": self.pretokenize,
+            "normalize": self.normalize,
+            "min_char_count": self.min_char_count,
             "special_tokens": self.special_tokens,
             "merges": [list(p) for p in self.merges],
             "vocab": self.vocab,
@@ -287,10 +365,15 @@ class BPETokenizer:
     def load(self, path: str):
         with open(path, encoding="utf-8") as f:
             data = json.load(f)
+        pre = int(data.get("pretokenize", 0))  # True/False in older files
+        if pre == 1:
+            raise ValueError(f"{path} was built with the first punctuation rules, which were "
+                             "replaced. Retrain it with scripts/train_own_bpe.py.")
+        self.pretokenize = pre
+        self.normalize = data.get("normalize", False)
+        self.min_char_count = data.get("min_char_count", 1)
         self.vocab = data["vocab"]
         self.special_tokens = data.get("special_tokens", self.special_tokens)
-        # Files trained before pre-tokenization existed must keep the old behaviour.
-        self.pretokenize = data.get("pretokenize", False)
         if data.get("version", 1) >= 2:
             self.merges = [tuple(p) for p in data["merges"]]
         else:  # v1 files stored [[a, b], merged]; JSON lists keep merge order

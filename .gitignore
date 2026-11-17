@@ -27,3 +27,6 @@ notebooks/.ipynb_checkpoints/
 
 # W&B
 wandb/
+
+# Cleaned corpora (built on Colab by scripts/clean_data.py)
+data/clean/

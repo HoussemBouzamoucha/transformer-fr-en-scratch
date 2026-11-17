@@ -14,6 +14,7 @@ from src.model.transformer import Transformer
 from src.training.loss import LabelSmoothedCrossEntropy
 from src.training.scheduler import InverseSqrtScheduler
 from src.tokenizer.loader import load_tokenizer
+from src.eval.metrics import evaluate_bleu
 from src.utils import set_seed, load_config
 
 
@@ -38,11 +39,22 @@ def train(config_path: str):
         print(f"Note: tokenizer vocab is {vocab_size}, config says {cfg['tokenizer']['vocab_size']}; using {vocab_size}")
     print(f"Tokenizer: {cfg['tokenizer'].get('type', 'sentencepiece')}, vocab {vocab_size}")
 
+    # One folder per config, so runs don't overwrite each other's best.pt.
+    ckpt_dir = Path(cfg["training"].get("checkpoint_dir", f"checkpoints/{Path(config_path).stem}"))
+
     # Data
     data_dir = cfg["data"].get("data_dir", f"data/raw/{cfg['data']['name']}")
     max_pairs = cfg["data"].get("max_train_pairs", None)
     train_set = Multi30KDataset("train", data_dir, tokenizer, max_len=cfg["data"]["max_tokens"], max_pairs=max_pairs)
     val_set   = Multi30KDataset("val",   data_dir, tokenizer, max_len=cfg["data"]["max_tokens"])
+    # Raw validation sentences for BLEU (scored against the untouched references).
+    bleu_n = cfg.get("logging", {}).get("bleu_sentences", 500)
+    with open(Path(data_dir) / "val.fr", encoding="utf-8") as f:
+        val_src = [l.strip() for l in f][:bleu_n]
+    with open(Path(data_dir) / "val.en", encoding="utf-8") as f:
+        val_ref = [l.strip() for l in f][:bleu_n]
+    restrict = cfg.get("inference", {}).get("restrict_target_vocab", True)
+
     collate = partial(collate_fn, pad_id=pad_id)
     train_loader = DataLoader(
         train_set,
@@ -155,20 +167,33 @@ def train(config_path: str):
                 val_tokens += n_tokens
 
         val_loss = (val_loss / val_tokens).item()
+        bleu_txt = ""
+        if bleu_n:
+            res = evaluate_bleu(model, tokenizer, val_src, val_ref, device,
+                                max_len=m["max_seq_len"] - 2, max_src_len=m["max_seq_len"],
+                                restrict_output=restrict)
+            bleu_txt = f" | val BLEU {res['bleu']:.2f} chrF {res['chrf']:.1f}"
         print(f"Epoch {epoch:2d} | step {step:6d} | lr {scheduler.get_lr():.6f} "
-              f"| train loss {train_loss:.4f} | val loss {val_loss:.4f}")
+              f"| train loss {train_loss:.4f} | val loss {val_loss:.4f}{bleu_txt}")
+        if bleu_n:
+            for src_l, hyp, ref in list(zip(val_src, res["hypotheses"], val_ref))[:3]:
+                print(f"    FR  {src_l}\n    OUT {hyp}\n    REF {ref}")
 
         if val_loss < best_val_loss:
             best_val_loss = val_loss
-            Path("checkpoints").mkdir(exist_ok=True)
+            ckpt_dir.mkdir(parents=True, exist_ok=True)
             torch.save({
                 "epoch": epoch,
                 "step": step,
                 "model_state": model.state_dict(),
                 "optimizer_state": optimizer.state_dict(),
                 "val_loss": val_loss,
-            }, "checkpoints/best.pt")
-            print(f"  → saved checkpoint (val loss {val_loss:.4f})")
+                "val_bleu": res["bleu"] if bleu_n else None,
+                "config": cfg,
+                # Ids only mean something with this exact vocab; evaluate.py checks it.
+                "tokenizer": tokenizer.fingerprint(),
+            }, ckpt_dir / "best.pt")
+            print(f"  → saved {ckpt_dir / 'best.pt'} (val loss {val_loss:.4f})")
 
         if step >= cfg["training"]["max_steps"]:
             print("Reached max steps.")

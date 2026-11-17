@@ -1,9 +1,16 @@
 """Train the joint FR/EN BPE tokenizer.
 
     python scripts/train_own_bpe.py --data-dir data/raw/multi30k --out data/vocab/own_bpe_8k_multi30k.json
-    python scripts/train_own_bpe.py --data-dir data/raw/wmt14 --out data/vocab/own_bpe_8k_wmt.json
+    python scripts/train_own_bpe.py --data-dir data/clean/wmt14  --out data/vocab/own_bpe_8k_wmt.json
+
+Point --data-dir at the same training set the model uses (for WMT: the output of
+scripts/clean_data.py). Lines are sampled at random over the whole file, with the
+same line numbers on both sides, so the sample is balanced and covers every domain.
+Afterwards it prints how much each vocab threshold lengthens validation sentences,
+to choose tokenizer.vocab_threshold in the config.
 """
 import argparse
+import random
 import sys
 import time
 from pathlib import Path
@@ -16,44 +23,61 @@ parser.add_argument("--data-dir", default="data/raw/multi30k")
 parser.add_argument("--out", default="data/vocab/own_bpe_8k_multi30k.json")
 parser.add_argument("--vocab-size", type=int, default=8000)
 parser.add_argument("--sample-size", type=int, default=100_000,
-                    help="max lines per language (same count for both keeps the vocab balanced)")
-parser.add_argument("--threshold", type=int, default=50,
-                    help="vocab threshold used only for the sanity check printout")
+                    help="max sentence pairs, sampled at random over the whole file")
+parser.add_argument("--min-char-count", type=int, default=5,
+                    help="rarer characters become <unk> (ASCII and French letters always kept)")
+parser.add_argument("--seed", type=int, default=42)
+parser.add_argument("--no-pretokenize", action="store_true",
+                    help="old behaviour: keep punctuation attached to words (for comparisons)")
 args = parser.parse_args()
+sys.stdout.reconfigure(encoding="utf-8")
 
 data_dir = Path(args.data_dir)
 out_path = Path(args.out)
 out_path.parent.mkdir(parents=True, exist_ok=True)
 
-corpora = {}
-for lang in ["fr", "en"]:
-    with open(data_dir / f"train.{lang}", encoding="utf-8") as f:
-        lines = []
-        for i, line in enumerate(f):
-            if i >= args.sample_size:
-                break
-            lines.append(line.strip())
-    corpora[lang] = lines
-    print(f"  train.{lang}: {len(lines)} lines")
+# Reservoir-sample pairs in one pass (works for multi-million-line files).
+rng = random.Random(args.seed)
+sample, n = [], 0
+with open(data_dir / "train.fr", encoding="utf-8") as f, open(data_dir / "train.en", encoding="utf-8") as e:
+    for n, (fr, en) in enumerate(zip(f, e), 1):
+        if len(sample) < args.sample_size:
+            sample.append((fr.strip(), en.strip()))
+        else:
+            j = rng.randrange(n)
+            if j < args.sample_size:
+                sample[j] = (fr.strip(), en.strip())
+corpora = {"fr": [p[0] for p in sample], "en": [p[1] for p in sample]}
+print(f"Sampled {len(sample):,} of {n:,} pairs from {data_dir}")
 
 print(f"\nTraining joint BPE (vocab_size={args.vocab_size})...")
 t0 = time.time()
-bpe = BPETokenizer()
-bpe.train(corpora, vocab_size=args.vocab_size, verbose=True)
+bpe = BPETokenizer(pretokenize=0 if args.no_pretokenize else 2)
+bpe.train(corpora, vocab_size=args.vocab_size, min_char_count=args.min_char_count, verbose=False)
 print(f"Took {time.time() - t0:.1f}s")
 bpe.save(str(out_path))
 
-# How much of the joint vocab each language actually uses.
-for lang, counts in bpe.lang_counts.items():
-    kept = sum(c >= args.threshold for c in counts.values())
-    print(f"  {lang}: uses {len(counts)} tokens, {kept} seen >= {args.threshold} times")
+# Threshold table on held-out text: how much longer sentences get.
+held = {}
+for lang in ("fr", "en"):
+    p = data_dir / f"val.{lang}"
+    held[lang] = ([l.strip() for l in open(p, encoding="utf-8")] if p.exists()
+                  else corpora[lang][-2000:])[:3000]
+print("\nVocab threshold -> extra tokens per sentence on validation (pick tokenizer.vocab_threshold):")
+base = {lang: sum(len(bpe.encode(l, lang=lang)) for l in lines) for lang, lines in held.items()}
+print("  threshold    " + "    ".join(f"{lang}" for lang in held))
+for t in (0, 1, 2, 5, 10, 20, 50):
+    cells = []
+    for lang, lines in held.items():
+        n_tok = sum(len(bpe.encode(l, lang=lang, threshold=t)) for l in lines)
+        cells.append(f"{100 * (n_tok / base[lang] - 1):+5.1f}%")
+    print(f"  {t:>9}    " + "   ".join(cells))
+unk = {lang: sum(bpe.encode(l, lang=lang).count(bpe.unk_id) for l in lines) for lang, lines in held.items()}
+print(f"  <unk> on validation: {unk}")
 
 print("\nSanity check:")
-samples = {"fr": "Un homme regarde une fenêtre.", "en": "A man is looking at a window."}
+samples = {"fr": "Un homme regarde l’herbe, près d’une fenêtre.", "en": "A man's looking at the grass, near a window."}
 for lang, text in samples.items():
-    plain = bpe.tokenize(text)
-    filtered = bpe.tokenize(text, lang=lang, threshold=args.threshold)
     print(f"  [{lang}] {text}")
-    print(f"       joint:    {plain}")
-    print(f"       filtered: {filtered}")
-    assert bpe.decode(bpe.encode(text)) == text
+    print(f"       {bpe.tokenize(text, lang=lang)}")
+    print(f"       decoded: {bpe.decode(bpe.encode(text, lang=lang))}")

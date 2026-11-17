@@ -1,63 +1,50 @@
+"""BLEU / chrF for FR -> EN.
+
+Sources are encoded exactly like training (lang="fr", same threshold); the
+model's ids are turned back into text with the tokenizer; and scores are
+computed against the raw reference sentences, never against references
+rebuilt from token ids (that would hide <unk>s and normalization changes).
+"""
 import torch
 import sacrebleu
-from tqdm import tqdm
+
+from src.inference.greedy import greedy_decode, strip_after_eos
 
 
-def greedy_decode(model, src, bos_id, eos_id, device, max_len=100):
-    model.eval()
-    with torch.no_grad():
-        memory, src_mask = model.encode(src)
-        tgt = torch.tensor([[bos_id]] * src.size(0)).to(device)
+def translate(model, tokenizer, src_lines, device, batch_size=64, max_len=100,
+              restrict_output=True, max_src_len=None):
+    """Translate raw French lines; returns English strings in the same order."""
+    allowed = tokenizer.target_token_ids("en") if restrict_output else None
+    pad, bos, eos = tokenizer.pad_id, tokenizer.bos_id, tokenizer.eos_id
 
-        done = torch.zeros(src.size(0), dtype=torch.bool).to(device)
-        for _ in range(max_len):
-            out = model.decode(tgt, memory, src_mask)
-            logits = model.output_projection(out[:, -1, :])
-            next_tokens = logits.argmax(-1)
-            next_tokens = next_tokens.masked_fill(done, eos_id)
-            tgt = torch.cat([tgt, next_tokens.unsqueeze(1)], dim=1)
-            done = done | (next_tokens == eos_id)
-            if done.all():
-                break
+    encoded = []
+    for line in src_lines:
+        ids = [bos] + tokenizer.encode(line, lang="fr") + [eos]
+        if max_src_len and len(ids) > max_src_len:  # positional table limit
+            ids = ids[: max_src_len - 1] + [eos]
+        encoded.append(ids)
 
-    return tgt[:, 1:]
-
-
-def decode_tokens(token_ids, sp, eos_id):
-    result = []
-    for ids in token_ids.tolist():
-        trimmed = []
-        for t in ids:
-            if t == eos_id:
-                break
-            trimmed.append(t)
-        result.append(sp.decode(trimmed))
-    return result
+    # Sort by length so batches have little padding, then restore order.
+    order = sorted(range(len(encoded)), key=lambda i: len(encoded[i]))
+    hyps = [None] * len(encoded)
+    for start in range(0, len(order), batch_size):
+        idx = order[start:start + batch_size]
+        batch = [torch.tensor(encoded[i]) for i in idx]
+        src = torch.nn.utils.rnn.pad_sequence(batch, batch_first=True, padding_value=pad).to(device)
+        out = greedy_decode(model, src, bos, eos, max_len=max_len, allowed_ids=allowed)
+        for i, ids in zip(idx, out.tolist()):
+            hyps[i] = tokenizer.decode(strip_after_eos(ids, eos))
+    return hyps
 
 
-def evaluate_bleu(model, data_loader, sp, bos_id, eos_id, device, max_batches=None):
-    hypotheses = []
-    references = []
-
-    for i, (src, tgt) in enumerate(tqdm(data_loader, desc="Evaluating")):
-        if max_batches and i >= max_batches:
-            break
-
-        src = src.to(device)
-        preds = greedy_decode(model, src, bos_id, eos_id, device)
-        hyps = decode_tokens(preds, sp, eos_id)
-        refs = decode_tokens(tgt, sp, eos_id)
-
-        hypotheses.extend(hyps)
-        references.extend(refs)
-
-    bleu = sacrebleu.corpus_bleu(hypotheses, [references])
-    chrf = sacrebleu.corpus_chrf(hypotheses, [references])
-
+def evaluate_bleu(model, tokenizer, src_lines, ref_lines, device, **kwargs):
+    hyps = translate(model, tokenizer, src_lines, device, **kwargs)
+    bleu = sacrebleu.corpus_bleu(hyps, [ref_lines])
+    chrf = sacrebleu.corpus_chrf(hyps, [ref_lines])
     return {
         "bleu": bleu.score,
         "bleu_signature": str(bleu),
         "chrf": chrf.score,
-        "hypotheses": hypotheses,
-        "references": references,
+        "hypotheses": hyps,
+        "references": ref_lines,
     }
