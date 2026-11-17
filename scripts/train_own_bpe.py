@@ -1,44 +1,59 @@
+"""Train the joint FR/EN BPE tokenizer.
+
+    python scripts/train_own_bpe.py --data-dir data/raw/multi30k --out data/vocab/own_bpe_8k_multi30k.json
+    python scripts/train_own_bpe.py --data-dir data/raw/wmt14 --out data/vocab/own_bpe_8k_wmt.json
+"""
+import argparse
 import sys
+import time
 from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from src.tokenizer.bpe import BPETokenizer
 
-DATA_DIR = Path("data/raw/wmt14")
-VOCAB_DIR = Path("data/vocab")
-VOCAB_DIR.mkdir(exist_ok=True)
+parser = argparse.ArgumentParser()
+parser.add_argument("--data-dir", default="data/raw/multi30k")
+parser.add_argument("--out", default="data/vocab/own_bpe_8k_multi30k.json")
+parser.add_argument("--vocab-size", type=int, default=8000)
+parser.add_argument("--sample-size", type=int, default=100_000,
+                    help="max lines per language (same count for both keeps the vocab balanced)")
+parser.add_argument("--threshold", type=int, default=50,
+                    help="vocab threshold used only for the sanity check printout")
+args = parser.parse_args()
 
-SAMPLE_SIZE = 100000  # lines per language
-VOCAB_SIZE  = 8000
+data_dir = Path(args.data_dir)
+out_path = Path(args.out)
+out_path.parent.mkdir(parents=True, exist_ok=True)
 
-print("Loading training data sample...")
-texts = []
-for fname in ["train.fr", "train.en"]:
-    with open(DATA_DIR / fname, encoding="utf-8") as f:
+corpora = {}
+for lang in ["fr", "en"]:
+    with open(data_dir / f"train.{lang}", encoding="utf-8") as f:
         lines = []
         for i, line in enumerate(f):
-            if i >= SAMPLE_SIZE:
+            if i >= args.sample_size:
                 break
             lines.append(line.strip())
-    texts.extend(lines)
-    print(f"  {fname}: {len(lines)} lines")
+    corpora[lang] = lines
+    print(f"  train.{lang}: {len(lines)} lines")
 
-print(f"Total lines: {len(texts)}")
-
-print(f"\nTraining BPE (vocab_size={VOCAB_SIZE})...")
+print(f"\nTraining joint BPE (vocab_size={args.vocab_size})...")
+t0 = time.time()
 bpe = BPETokenizer()
-bpe.train(texts, vocab_size=VOCAB_SIZE, verbose=True)
-
-out_path = VOCAB_DIR / "own_bpe_8k.json"
+bpe.train(corpora, vocab_size=args.vocab_size, verbose=True)
+print(f"Took {time.time() - t0:.1f}s")
 bpe.save(str(out_path))
-print(f"\nDone. Saved to {out_path}")
 
-# Sanity check
+# How much of the joint vocab each language actually uses.
+for lang, counts in bpe.lang_counts.items():
+    kept = sum(c >= args.threshold for c in counts.values())
+    print(f"  {lang}: uses {len(counts)} tokens, {kept} seen >= {args.threshold} times")
+
 print("\nSanity check:")
-test_fr = "Un homme regarde une fenêtre."
-test_en = "A man is looking at a window."
-for text in [test_fr, test_en]:
-    ids = bpe.encode(text)
-    tokens = [bpe.id_to_token[i] for i in ids[1:-1]]
-    print(f"  {text}")
-    print(f"  {tokens}")
+samples = {"fr": "Un homme regarde une fenêtre.", "en": "A man is looking at a window."}
+for lang, text in samples.items():
+    plain = bpe.tokenize(text)
+    filtered = bpe.tokenize(text, lang=lang, threshold=args.threshold)
+    print(f"  [{lang}] {text}")
+    print(f"       joint:    {plain}")
+    print(f"       filtered: {filtered}")
+    assert bpe.decode(bpe.encode(text)) == text

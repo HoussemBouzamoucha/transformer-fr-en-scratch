@@ -21,6 +21,12 @@ model:
 tokenizer:
   type: sentencepiece
   vocab_size: 8000
+  # To use the own joint BPE, first run on Kaggle:
+  #   python scripts/train_own_bpe.py --data-dir data/raw/wmt14 --out data/vocab/own_bpe_8k_wmt.json
+  # then switch to:
+  # type: bpe
+  # path: data/vocab/own_bpe_8k_wmt.json
+  # vocab_threshold: 50
 
 training:
   batch_tokens: 8192

@@ -7,13 +7,13 @@ os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 import torch
 from torch.utils.data import DataLoader
 from functools import partial
-import sentencepiece as spm
 from tqdm import tqdm
 
 from src.data.dataset import Multi30KDataset, collate_fn
 from src.model.transformer import Transformer
 from src.training.loss import LabelSmoothedCrossEntropy
 from src.training.scheduler import InverseSqrtScheduler
+from src.tokenizer.loader import load_tokenizer
 from src.utils import set_seed, load_config
 
 
@@ -29,16 +29,20 @@ def train(config_path: str):
         print(f"GPU: {torch.cuda.get_device_name(0)}")
 
     # Tokenizer
-    sp_model = cfg["data"].get("sp_model", "data/vocab/spm_8k_wmt.model")
-    sp = spm.SentencePieceProcessor()
-    sp.load(sp_model)
-    pad_id = sp.piece_to_id("<pad>")
+    tokenizer = load_tokenizer(cfg)
+    pad_id = tokenizer.pad_id
+    # The real vocab can be smaller than the configured target (BPE stops early
+    # when no pair occurs twice), so size the model from the tokenizer itself.
+    vocab_size = tokenizer.vocab_size
+    if vocab_size != cfg["tokenizer"]["vocab_size"]:
+        print(f"Note: tokenizer vocab is {vocab_size}, config says {cfg['tokenizer']['vocab_size']}; using {vocab_size}")
+    print(f"Tokenizer: {cfg['tokenizer'].get('type', 'sentencepiece')}, vocab {vocab_size}")
 
     # Data
     data_dir = cfg["data"].get("data_dir", f"data/raw/{cfg['data']['name']}")
     max_pairs = cfg["data"].get("max_train_pairs", None)
-    train_set = Multi30KDataset("train", data_dir, sp_model, max_len=cfg["data"]["max_tokens"], max_pairs=max_pairs)
-    val_set   = Multi30KDataset("val",   data_dir, sp_model, max_len=cfg["data"]["max_tokens"])
+    train_set = Multi30KDataset("train", data_dir, tokenizer, max_len=cfg["data"]["max_tokens"], max_pairs=max_pairs)
+    val_set   = Multi30KDataset("val",   data_dir, tokenizer, max_len=cfg["data"]["max_tokens"])
     collate = partial(collate_fn, pad_id=pad_id)
     train_loader = DataLoader(
         train_set,
@@ -62,7 +66,7 @@ def train(config_path: str):
     # Model
     m = cfg["model"]
     model = Transformer(
-        vocab_size       = cfg["tokenizer"]["vocab_size"],
+        vocab_size       = vocab_size,
         d_model          = m["d_model"],
         n_heads          = m["n_heads"],
         n_encoder_layers = m["n_encoder_layers"],
@@ -71,6 +75,7 @@ def train(config_path: str):
         max_len          = m["max_seq_len"],
         dropout          = m["dropout"],
         pad_id           = pad_id,
+        tie_embeddings   = m.get("shared_vocab", True),
     ).to(device)
 
     n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
@@ -78,7 +83,7 @@ def train(config_path: str):
 
     # Loss, optimizer, scheduler
     criterion = LabelSmoothedCrossEntropy(
-        cfg["tokenizer"]["vocab_size"],
+        vocab_size,
         cfg["training"]["label_smoothing"],
         pad_id
     )
@@ -91,8 +96,10 @@ def train(config_path: str):
 
     for epoch in range(1, 1000):
         model.train()
-        total_loss = 0.0
-        total_tokens = 0
+        # Accumulate on the GPU; converting to Python floats every step (.item())
+        # forces a CPU-GPU sync and stalls the launch queue.
+        total_loss = torch.zeros((), device=device)
+        total_tokens = torch.zeros((), device=device)
 
         for src, tgt in tqdm(train_loader, desc=f"Epoch {epoch}"):
             src = src.to(device, non_blocking=True)
@@ -104,28 +111,33 @@ def train(config_path: str):
             with torch.amp.autocast('cuda', enabled=cfg["training"]["fp16"] and device.type == "cuda"):
                 logits = model(src, tgt_in)
                 loss = criterion(
-                    logits.reshape(-1, cfg["tokenizer"]["vocab_size"]),
+                    logits.reshape(-1, vocab_size),
                     tgt_out.reshape(-1)
                 )
 
             scaler.scale(loss).backward()
             scaler.unscale_(optimizer)
             torch.nn.utils.clip_grad_norm_(model.parameters(), cfg["training"]["grad_clip"])
+            # Set the LR for this step *before* the update, so step 1 uses the
+            # warmup LR instead of Adam's default 1e-3.
+            scheduler.step()
             scaler.step(optimizer)
             scaler.update()
-            scheduler.step()
             step += 1
 
-            n_tokens = (tgt_out != pad_id).sum().item()
-            total_loss   += loss.item() * n_tokens
+            n_tokens = (tgt_out != pad_id).sum()
+            total_loss   += loss.detach().float() * n_tokens
             total_tokens += n_tokens
 
-        train_loss = total_loss / total_tokens
+            if step >= cfg["training"]["max_steps"]:
+                break
+
+        train_loss = (total_loss / total_tokens).item()
 
         # Validation
         model.eval()
-        val_loss = 0.0
-        val_tokens = 0
+        val_loss = torch.zeros((), device=device)
+        val_tokens = torch.zeros((), device=device)
         with torch.no_grad():
             for src, tgt in val_loader:
                 src = src.to(device, non_blocking=True)
@@ -135,14 +147,14 @@ def train(config_path: str):
                 with torch.amp.autocast('cuda', enabled=cfg["training"]["fp16"] and device.type == "cuda"):
                     logits = model(src, tgt_in)
                     loss = criterion(
-                        logits.reshape(-1, cfg["tokenizer"]["vocab_size"]),
+                        logits.reshape(-1, vocab_size),
                         tgt_out.reshape(-1)
                     )
-                n_tokens = (tgt_out != pad_id).sum().item()
-                val_loss   += loss.item() * n_tokens
+                n_tokens = (tgt_out != pad_id).sum()
+                val_loss   += loss.float() * n_tokens
                 val_tokens += n_tokens
 
-        val_loss /= val_tokens
+        val_loss = (val_loss / val_tokens).item()
         print(f"Epoch {epoch:2d} | step {step:6d} | lr {scheduler.get_lr():.6f} "
               f"| train loss {train_loss:.4f} | val loss {val_loss:.4f}")
 

@@ -51,6 +51,7 @@ class Transformer(nn.Module):
         max_len: int = 128,
         dropout: float = 0.1,
         pad_id: int = 0,
+        tie_embeddings: bool = True,
     ):
         super().__init__()
         self.pad_id = pad_id
@@ -58,7 +59,13 @@ class Transformer(nn.Module):
         self.encoder = Encoder(vocab_size, d_model, n_heads, n_encoder_layers, d_ff, max_len, dropout)
         self.decoder = Decoder(vocab_size, d_model, n_heads, n_decoder_layers, d_ff, max_len, dropout)
 
-        # Tied output projection — shares weights with decoder token embedding
+        # Three-way tying (Vaswani et al. 2017, sec. 3.4): with a joint FR/EN
+        # vocabulary, the encoder input embedding, decoder input embedding and
+        # output projection are one matrix. Turn off for separate vocabularies.
+        if tie_embeddings:
+            self.decoder.embeddings.token = self.encoder.embeddings.token
+
+        # The output projection always shares the decoder token embedding.
         self.output_projection = nn.Linear(d_model, vocab_size, bias=False)
         self.output_projection.weight = self.decoder.embeddings.token.embedding.weight
 
