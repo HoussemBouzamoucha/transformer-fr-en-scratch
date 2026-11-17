@@ -10,12 +10,8 @@ import argparse
 import sys
 from pathlib import Path
 
-import torch
-
 from src.eval.metrics import evaluate_bleu
-from src.model.transformer import Transformer
-from src.tokenizer.loader import check_fingerprint, load_tokenizer
-from src.utils import load_config
+from src.inference.translator import load_model
 
 
 def main():
@@ -30,23 +26,9 @@ def main():
     args = ap.parse_args()
     sys.stdout.reconfigure(encoding="utf-8")
 
-    cfg = load_config(args.config)
-    ckpt_path = Path(args.checkpoint or f"checkpoints/{Path(args.config).stem}/best.pt")
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
-    tokenizer = load_tokenizer(cfg)
-    ckpt = torch.load(ckpt_path, map_location=device, weights_only=False)
-    if not args.force:
-        check_fingerprint(ckpt.get("tokenizer"), tokenizer)
-
+    model, tokenizer, cfg, ckpt, ckpt_path, device = load_model(
+        args.config, args.checkpoint, force=args.force)
     m = ckpt.get("config", cfg)["model"]
-    model = Transformer(
-        vocab_size=tokenizer.vocab_size, d_model=m["d_model"], n_heads=m["n_heads"],
-        n_encoder_layers=m["n_encoder_layers"], n_decoder_layers=m["n_decoder_layers"],
-        d_ff=m["d_ff"], max_len=m["max_seq_len"], dropout=0.0, pad_id=tokenizer.pad_id,
-        tie_embeddings=m.get("shared_vocab", True),
-    ).to(device)
-    model.load_state_dict(ckpt["model_state"])
 
     data_dir = Path(cfg["data"].get("data_dir", f"data/raw/{cfg['data']['name']}"))
     src = [l.strip() for l in open(data_dir / f"{args.split}.fr", encoding="utf-8")]
