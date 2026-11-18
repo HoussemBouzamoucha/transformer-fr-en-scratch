@@ -1,5 +1,7 @@
+import json
 import sys
 import os
+import time
 from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent))
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
@@ -105,6 +107,12 @@ def train(config_path: str):
 
     best_val_loss = float("inf")
     step = 0
+    # Timing for the tokenizer benchmark. train_seconds counts only the training
+    # loop (no validation / BLEU decoding); the epoch-end .item() syncs the GPU.
+    t_start = time.time()
+    train_seconds = 0.0
+    tokens_seen = {"src": 0, "tgt": 0}
+    best = {}
 
     for epoch in range(1, 1000):
         model.train()
@@ -112,6 +120,8 @@ def train(config_path: str):
         # forces a CPU-GPU sync and stalls the launch queue.
         total_loss = torch.zeros((), device=device)
         total_tokens = torch.zeros((), device=device)
+        src_tokens = torch.zeros((), device=device)
+        t_epoch = time.time()
 
         for src, tgt in tqdm(train_loader, desc=f"Epoch {epoch}"):
             src = src.to(device, non_blocking=True)
@@ -140,11 +150,15 @@ def train(config_path: str):
             n_tokens = (tgt_out != pad_id).sum()
             total_loss   += loss.detach().float() * n_tokens
             total_tokens += n_tokens
+            src_tokens   += (src != pad_id).sum()
 
             if step >= cfg["training"]["max_steps"]:
                 break
 
         train_loss = (total_loss / total_tokens).item()
+        train_seconds += time.time() - t_epoch
+        tokens_seen["tgt"] += int(total_tokens.item())
+        tokens_seen["src"] += int(src_tokens.item())
 
         # Validation
         model.eval()
@@ -192,12 +206,31 @@ def train(config_path: str):
                 "config": cfg,
                 # Ids only mean something with this exact vocab; evaluate.py checks it.
                 "tokenizer": tokenizer.fingerprint(),
+                "train_seconds": train_seconds,
             }, ckpt_dir / "best.pt")
+            best = {"best_step": step, "best_epoch": epoch, "best_val_loss": val_loss,
+                    "best_val_bleu": res["bleu"] if bleu_n else None,
+                    "train_seconds_to_best": train_seconds}
             print(f"  → saved {ckpt_dir / 'best.pt'} (val loss {val_loss:.4f})")
 
         if step >= cfg["training"]["max_steps"]:
             print("Reached max steps.")
             break
+
+    summary = {
+        "config": str(config_path), "seed": cfg["seed"], "device": str(device),
+        "gpu": torch.cuda.get_device_name(0) if device.type == "cuda" else None,
+        "parameters": n_params, "vocab_size": vocab_size, "steps": step, "epochs": epoch,
+        "train_seconds": train_seconds, "total_seconds": time.time() - t_start,
+        "steps_per_second": step / train_seconds if train_seconds else None,
+        "src_tokens_per_second": tokens_seen["src"] / train_seconds if train_seconds else None,
+        "tgt_tokens_per_second": tokens_seen["tgt"] / train_seconds if train_seconds else None,
+        **best,
+    }
+    ckpt_dir.mkdir(parents=True, exist_ok=True)
+    (ckpt_dir / "train_summary.json").write_text(json.dumps(summary, indent=2), encoding="utf-8")
+    print(f"Training loop {train_seconds / 60:.1f} min ({summary['steps_per_second'] or 0:.2f} steps/s), "
+          f"best step {best.get('best_step')} -> {ckpt_dir / 'train_summary.json'}")
 
 
 if __name__ == "__main__":
