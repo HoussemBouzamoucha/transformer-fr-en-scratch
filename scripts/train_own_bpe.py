@@ -8,6 +8,10 @@ scripts/clean_data.py). Lines are sampled at random over the whole file, with th
 same line numbers on both sides, so the sample is balanced and covers every domain.
 Afterwards it prints how much each vocab threshold lengthens validation sentences,
 to choose tokenizer.vocab_threshold in the config.
+
+The vocab is fitted to --vocab-threshold (default 0, as in thin_slice.yaml): every
+slot goes to a token the training text really uses at that threshold. Use the
+same value as tokenizer.vocab_threshold in the config, or slots are wasted.
 """
 import argparse
 import sys
@@ -27,6 +31,9 @@ parser.add_argument("--sample-size", type=int, default=100_000,
 parser.add_argument("--min-char-count", type=int, default=5,
                     help="rarer characters become <unk> (ASCII and French letters always kept)")
 parser.add_argument("--seed", type=int, default=42)
+parser.add_argument("--vocab-threshold", type=int, default=0,
+                    help="the tokenizer.vocab_threshold the model will use; the vocab is filled "
+                         "with tokens actually used at that threshold (-1 = classic BPE, no fitting)")
 parser.add_argument("--no-pretokenize", action="store_true",
                     help="old behaviour: keep punctuation attached to words (for comparisons)")
 args = parser.parse_args()
@@ -43,7 +50,8 @@ print(f"Sampled {len(sample):,} of {n:,} pairs from {data_dir}")
 print(f"\nTraining joint BPE (vocab_size={args.vocab_size})...")
 t0 = time.time()
 bpe = BPETokenizer(pretokenize=0 if args.no_pretokenize else 2)
-bpe.train(corpora, vocab_size=args.vocab_size, min_char_count=args.min_char_count, verbose=False)
+bpe.train(corpora, vocab_size=args.vocab_size, min_char_count=args.min_char_count,
+          fit_threshold=None if args.vocab_threshold < 0 else args.vocab_threshold)
 print(f"Took {time.time() - t0:.1f}s")
 bpe.save(str(out_path))
 

@@ -163,3 +163,59 @@ def test_save_load_roundtrip(tmp_path):
     for text, lang in [("le chat mange", "fr"), ("the cats eat", "en")]:
         assert loaded.encode(text) == bpe.encode(text)
         assert loaded.encode(text, lang=lang, threshold=5) == bpe.encode(text, lang=lang, threshold=5)
+
+
+def _used_tokens(bpe, threshold):
+    used = set()
+    for lang, lines in (("fr", FR), ("en", EN)):
+        for line in lines:
+            used.update(bpe.encode(line, lang=lang, threshold=threshold))
+    return used
+
+
+def test_classic_bpe_wastes_slots_that_fitting_reclaims():
+    words = ["photographie", "photographe", "photographier", "photo", "graphe"]
+    fr = [" ".join(words)] * 3 + FR
+    classic = BPETokenizer()
+    classic.train({"fr": fr, "en": EN}, vocab_size=400)
+    fitted = BPETokenizer()
+    fitted.train({"fr": fr, "en": EN}, vocab_size=400, fit_threshold=0)
+    merged = lambda b: {i for t, i in b.vocab.items() if t in b.split_of}
+    corpus = {"fr": fr, "en": EN}
+
+    def unused(b):
+        used = set()
+        for lang, lines in corpus.items():
+            for line in lines:
+                used.update(b.encode(line, lang=lang))
+        return merged(b) - used
+
+    assert unused(classic)            # intermediates like "photogra" never come out
+    assert not unused(fitted)         # every merge result in the vocab is used
+
+
+def test_fitted_vocab_only_holds_tokens_used_at_its_threshold():
+    bpe = BPETokenizer()
+    bpe.train({"fr": FR, "en": EN}, vocab_size=400, fit_threshold=5)
+    assert bpe.fit_threshold == 5
+    merged = {i for t, i in bpe.vocab.items() if t in bpe.split_of}
+    assert merged <= _used_tokens(bpe, threshold=5)
+    assert sorted(bpe.vocab.values()) == list(range(len(bpe.vocab)))
+
+
+def test_fitted_vocab_respects_size_and_roundtrips(tmp_path):
+    bpe = BPETokenizer()
+    bpe.train({"fr": FR, "en": EN}, vocab_size=230, fit_threshold=0)
+    assert 200 < len(bpe.vocab) <= 230   # ~197 specials + base chars, then merges
+    path = tmp_path / "fit.json"
+    bpe.save(str(path))
+    loaded = BPETokenizer().load(str(path))
+    assert loaded.fit_threshold == 0
+    for text, lang in [("le chat mange le poisson", "fr"), ("the dogs eat fish", "en"),
+                       ("chien inconnu", "fr")]:
+        ids = loaded.encode(text, lang=lang)
+        assert ids == bpe.encode(text, lang=lang)
+        assert bpe.unk_id not in ids
+        assert loaded.decode(ids) == text
+        # whatever merges ran, every emitted token has a slot
+        assert all(t in loaded.vocab for t in loaded.tokenize(text, lang=lang))

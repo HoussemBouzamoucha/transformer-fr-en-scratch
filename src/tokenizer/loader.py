@@ -81,6 +81,11 @@ class JointBPETokenizer:
         self.path = path
         self.bpe = BPETokenizer().load(path)
         self.threshold = vocab_threshold
+        fitted = self.bpe.fit_threshold
+        if fitted is not None and fitted != vocab_threshold:
+            print(f"Warning: {path} was fitted for vocab_threshold={fitted} but the config uses "
+                  f"{vocab_threshold}; some vocab slots will go unused. Set tokenizer.vocab_threshold: "
+                  f"{fitted} or retrain with scripts/train_own_bpe.py --vocab-threshold {vocab_threshold}")
         self.pad_id = self.bpe.pad_id
         self.bos_id = self.bpe.bos_id
         self.eos_id = self.bpe.eos_id

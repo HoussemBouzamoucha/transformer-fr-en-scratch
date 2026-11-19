@@ -19,9 +19,11 @@ tokenizer:
   type: bpe                 # bpe (own joint BPE) | sentencepiece
   path: data/vocab/own_bpe_8k_multi30k.json   # scripts/train_own_bpe.py
   vocab_size: 8000
-  # Split tokens seen < N times in the sentence's own language. 5 costs ~0.5%
-  # longer sequences on Multi30k; 50 (Sennrich's WMT value) costs ~36% here.
-  vocab_threshold: 5
+  # Split tokens seen < N times in the sentence's own language. Must match the
+  # --vocab-threshold the BPE was fitted with (scripts/train_own_bpe.py).
+  # 0 fills all 8k slots with used tokens; 5 only finds 7,256 on Multi30k and
+  # blocks FR/EN sharing (data/vocab/own_bpe_8k_multi30k_t5.json).
+  vocab_threshold: 0
 
 training:
   batch_tokens: 8192

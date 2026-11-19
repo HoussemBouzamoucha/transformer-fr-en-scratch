@@ -49,6 +49,7 @@ class BPETokenizer:
         self.pretokenize = int(pretokenize)
         self.normalize = normalize
         self.min_char_count = 1
+        self.fit_threshold = None  # vocab_threshold the vocab was fitted to (None = classic BPE)
         self.merges = []          # ordered list of (a, b); index = merge rank
         self.merge_ranks = {}     # (a, b) -> rank
         self.split_of = {}        # merged token -> (a, b) that first produced it
@@ -145,13 +146,21 @@ class BPETokenizer:
                 counts.update(self._pieces(word, lang))
         return counts
 
-    def train(self, corpora, vocab_size: int, min_char_count: int = 1, verbose: bool = False):
+    def train(self, corpora, vocab_size: int, min_char_count: int = 1, verbose: bool = False,
+              fit_threshold=None):
         """Learn joint merges.
 
         corpora: {"fr": [lines], "en": [lines]} (or a plain list of lines, which
         trains without per-language counts).
         min_char_count: characters seen fewer times (and not in ALWAYS_KEEP) get
         no vocab entry and encode as <unk>, so web-text junk doesn't use up slots.
+        fit_threshold: None = classic BPE, every merge result gets a vocab slot.
+          An int (the vocab_threshold the model will encode with, 0 = none) fills
+          the vocab with tokens the training text actually USES: merge results
+          that only exist on the way to longer tokens ("wom" -> "woman"), or that
+          the threshold always splits again, get no slot, and more merges are
+          learned to fill vocab_size. Tokens without a slot are split back into
+          their two parts when encoding.
         """
         if not isinstance(corpora, dict):
             corpora = {None: list(corpora)}
@@ -196,7 +205,10 @@ class BPETokenizer:
         heapify(heap)
 
         self.merges, self.split_of = [], {}
-        while len(self.vocab) < vocab_size and heap:
+        # Fitting needs spare merges to choose from; classic BPE stops at vocab_size.
+        n_new_max = vocab_size - len(self.vocab) if fit_threshold is None else 4 * vocab_size
+        new_tokens = []           # merge results in the order they were first made
+        while len(new_tokens) < n_new_max and heap:
             neg, pair = heappop(heap)
             count = pair_counts.get(pair, 0)
             if -neg != count:
@@ -207,10 +219,11 @@ class BPETokenizer:
             a, b = pair
             merged = a + b
             self.merges.append(pair)
-            self.split_of.setdefault(merged, pair)
             # Two different pairs can spell the same string ("ab"+"c", "a"+"bc");
-            # keep its first id so ids stay contiguous.
-            self.vocab.setdefault(merged, len(self.vocab))
+            # it gets one vocab entry, split the way it was first made.
+            if merged not in self.split_of:
+                self.split_of[merged] = pair
+                new_tokens.append(merged)
 
             changed = set()
             for wi in list(where[pair]):
@@ -244,22 +257,86 @@ class BPETokenizer:
             if verbose and len(self.merges) % 500 == 0:
                 print(f"  merge {len(self.merges)}: {pair} -> {merged!r} (count={count})")
 
+        lang_pieces = {lang: c for lang, c in lang_pieces.items() if lang is not None}
+        if fit_threshold is None:
+            kept, self.lang_counts = set(new_tokens), None
+        else:
+            k, kept, self.lang_counts = self._fit_vocab(lang_pieces, vocab_size, fit_threshold)
+            short = len(self.vocab) + len(kept) < vocab_size
+            print(f"Fitted vocab (threshold {fit_threshold}): first {k:,} of {len(self.merges):,} merges"
+                  + (f"; ran out of merges, vocab is {len(self.vocab) + len(kept):,}, not {vocab_size:,}"
+                     if short else ""))
+            self.merges = self.merges[:k]
+            self.split_of = {}
+            for a, b in self.merges:
+                self.split_of.setdefault(a + b, (a, b))
+        for tok in new_tokens:
+            if tok in kept:
+                self.vocab[tok] = len(self.vocab)
+        self.fit_threshold = fit_threshold
         self._finalize()
 
         # Per-language token counts under the final segmentation.
-        self.lang_counts = {}
-        for lang, counts in lang_pieces.items():
-            if lang is None:
-                continue
-            tc = Counter()
-            for piece, f in counts.items():
-                for tok in self._segment(piece):
-                    if tok in self.vocab:
-                        tc[tok] += f
-            self.lang_counts[lang] = dict(tc)
+        if self.lang_counts is None:
+            self.lang_counts = self._count_tokens(lang_pieces, set(self.vocab), self.merge_ranks)
 
         print(f"Training done. Vocab size: {len(self.vocab)}, merges: {len(self.merges)}, "
               f"rare chars -> <unk>: {len(rare)}")
+
+    def _count_tokens(self, lang_pieces, vocab, ranks, allowed=None):
+        """Per-language token counts of the training pieces, encoded like encode() does."""
+        out = {}
+        for lang, counts in lang_pieces.items():
+            al = allowed.get(lang) if allowed else None
+            tc = Counter()
+            for piece, f in counts.items():
+                for tok in self._segment(piece, ranks):
+                    for t in self._split(tok, vocab, al):
+                        if t in vocab:
+                            tc[t] += f
+            out[lang] = dict(tc)
+        return out
+
+    def _fit_vocab(self, lang_pieces, vocab_size, threshold):
+        """Largest prefix of self.merges whose USED tokens fit in vocab_size.
+
+        For a prefix, start with every merge result in the vocab, encode the
+        training text (threshold split included), drop the merge results that
+        never come out, and repeat until nothing changes (dropping a token can
+        only make its parts more frequent, never less). Returns (k, kept, counts).
+        """
+        n_fixed = len(self.vocab)  # specials + base characters
+        all_merges = self.merges
+        cache = {}
+
+        def used(k):
+            if k in cache:
+                return cache[k]
+            ranks = {p: r for r, p in enumerate(all_merges[:k])}
+            kept = {a + b for a, b in all_merges[:k]}
+            while True:
+                vocab = self.base_tokens | kept
+                counts = self._count_tokens(lang_pieces, vocab, ranks)
+                allowed = ({lang: {t for t, c in tc.items() if c >= threshold}
+                            for lang, tc in counts.items()} if threshold > 0 else None)
+                emitted = set()
+                for tc in self._count_tokens(lang_pieces, vocab, ranks, allowed).values():
+                    emitted.update(tc)
+                if kept <= emitted:
+                    cache[k] = (kept, counts)
+                    return cache[k]
+                kept &= emitted
+
+        lo, hi = 0, len(all_merges)
+        if n_fixed + len(used(hi)[0]) <= vocab_size:
+            return (hi, *used(hi))
+        while hi - lo > 1:  # invariant: used(lo) fits, used(hi) doesn't
+            mid = (lo + hi) // 2
+            if n_fixed + len(used(mid)[0]) <= vocab_size:
+                lo = mid
+            else:
+                hi = mid
+        return (lo, *used(lo))
 
     def _finalize(self):
         self.merge_ranks = {pair: r for r, pair in enumerate(self.merges)}
@@ -267,10 +344,11 @@ class BPETokenizer:
         self._cache = {}
 
     # ------------------------------------------------------------- encoding
-    def _segment(self, piece):
+    def _segment(self, piece, ranks=None):
         """Apply merges by rank (lowest first), like the original BPE."""
         syms = list(piece) + [self.EOW]
-        ranks = self.merge_ranks
+        if ranks is None:
+            ranks = self.merge_ranks
         while len(syms) > 1:
             best_rank = None
             for i in range(len(syms) - 1):
@@ -297,12 +375,13 @@ class BPETokenizer:
             return None
         return {t for t, c in self.lang_counts[lang].items() if c >= threshold}
 
-    def _split_rare(self, tok, allowed):
-        """Undo merges until every piece is frequent enough in this language."""
-        if tok in allowed or tok in self.base_tokens or tok not in self.split_of:
+    def _split(self, tok, vocab, allowed=None):
+        """Undo merges until every piece has a vocab slot and, when `allowed` is
+        given, is frequent enough in this language. Base characters stay."""
+        if tok not in self.split_of or (tok in vocab and (allowed is None or tok in allowed)):
             return [tok]
         a, b = self.split_of[tok]
-        return self._split_rare(a, allowed) + self._split_rare(b, allowed)
+        return self._split(a, vocab, allowed) + self._split(b, vocab, allowed)
 
     def tokenize(self, text: str, lang=None, threshold: int = 0):
         allowed = self._allowed(lang, threshold)
@@ -311,9 +390,8 @@ class BPETokenizer:
             key = (word, lang, threshold)
             toks = self._cache.get(key)
             if toks is None:
-                toks = [t for piece in self._pieces(word, lang) for t in self._segment(piece)]
-                if allowed is not None:
-                    toks = [p for tok in toks for p in self._split_rare(tok, allowed)]
+                toks = [p for piece in self._pieces(word, lang) for tok in self._segment(piece)
+                        for p in self._split(tok, self.vocab, allowed)]
                 if len(self._cache) < 500_000:
                     self._cache[key] = toks
             tokens.extend(toks)
@@ -353,6 +431,7 @@ class BPETokenizer:
             "pretokenize": self.pretokenize,
             "normalize": self.normalize,
             "min_char_count": self.min_char_count,
+            "fit_threshold": self.fit_threshold,
             "special_tokens": self.special_tokens,
             "merges": [list(p) for p in self.merges],
             "vocab": self.vocab,
@@ -372,6 +451,7 @@ class BPETokenizer:
         self.pretokenize = pre
         self.normalize = data.get("normalize", False)
         self.min_char_count = data.get("min_char_count", 1)
+        self.fit_threshold = data.get("fit_threshold")
         self.vocab = data["vocab"]
         self.special_tokens = data.get("special_tokens", self.special_tokens)
         if data.get("version", 1) >= 2:
