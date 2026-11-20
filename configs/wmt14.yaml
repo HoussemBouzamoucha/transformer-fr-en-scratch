@@ -4,9 +4,10 @@ data:
   name: wmt14
   lang_pair: fr-en
   max_tokens: 100
-  data_dir: data/raw/wmt14
+  # Output of: python scripts/clean_data.py --src-dir data/raw/wmt14 --out-dir data/clean/wmt14 --max-pairs 200000
+  # (already a random 200k sample, so no max_train_pairs here)
+  data_dir: data/clean/wmt14
   sp_model: data/vocab/spm_8k_wmt.model
-  max_train_pairs: 200000
 
 model:
   d_model: 256
@@ -19,8 +20,13 @@ model:
   shared_vocab: true
 
 tokenizer:
-  type: sentencepiece
+  type: bpe
+  # python scripts/train_own_bpe.py --data-dir data/clean/wmt14 --out data/vocab/own_bpe_8k_wmt.json
+  path: data/vocab/own_bpe_8k_wmt.json
   vocab_size: 8000
+  # Pick from the threshold table train_own_bpe.py prints: the largest value
+  # that costs only a few % extra length. 50 is Sennrich's value for ~4M pairs.
+  vocab_threshold: 10
 
 training:
   batch_tokens: 8192
@@ -30,7 +36,11 @@ training:
   label_smoothing: 0.1
   fp16: true
 
+inference:
+  restrict_target_vocab: true
+
 logging:
   backend: tensorboard
   log_every: 100
   eval_every: 2000
+  bleu_sentences: 500

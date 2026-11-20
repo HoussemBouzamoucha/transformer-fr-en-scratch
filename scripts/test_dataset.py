@@ -1,21 +1,21 @@
 from torch.utils.data import DataLoader
 from functools import partial
-import sentencepiece as spm
-from src.data.dataset import Multi30KDataset, collate_fn
-
 import sys
 from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
+from src.data.dataset import Multi30KDataset, collate_fn
+from src.tokenizer.loader import load_tokenizer
+from src.utils import load_config
 
-SP_MODEL = "data/vocab/spm_8k.model"
+
+CONFIG = sys.argv[1] if len(sys.argv) > 1 else "configs/thin_slice.yaml"
 DATA_DIR = "data/raw/multi30k"
 
-sp = spm.SentencePieceProcessor()
-sp.load(SP_MODEL)
-pad_id = sp.piece_to_id("<pad>")
+tokenizer = load_tokenizer(load_config(CONFIG))
+pad_id = tokenizer.pad_id
 
-dataset = Multi30KDataset("train", DATA_DIR, SP_MODEL)
+dataset = Multi30KDataset("train", DATA_DIR, tokenizer)
 print(f"Train pairs after length filter: {len(dataset)}")
 
 loader = DataLoader(

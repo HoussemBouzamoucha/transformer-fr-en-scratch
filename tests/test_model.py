@@ -35,6 +35,22 @@ def test_tied_embeddings():
     print("  tied embeddings: OK")
 
 
+def test_three_way_tied_embeddings():
+    model = Transformer(VOCAB_SIZE, d_model=D_MODEL, n_heads=2,
+                        n_encoder_layers=2, n_decoder_layers=2,
+                        d_ff=512, dropout=0.0)
+    enc = model.encoder.embeddings.token.embedding.weight
+    assert enc is model.decoder.embeddings.token.embedding.weight
+    assert enc is model.output_projection.weight
+
+    untied = Transformer(VOCAB_SIZE, d_model=D_MODEL, n_heads=2,
+                         n_encoder_layers=2, n_decoder_layers=2,
+                         d_ff=512, dropout=0.0, tie_embeddings=False)
+    assert untied.encoder.embeddings.token.embedding.weight is not            untied.decoder.embeddings.token.embedding.weight
+    n = lambda m: sum(p.numel() for p in m.parameters())
+    assert n(untied) - n(model) == VOCAB_SIZE * D_MODEL
+
+
 def test_overfit_one_batch():
     """The most important test — model must drive loss to near zero on one batch."""
     torch.manual_seed(42)
