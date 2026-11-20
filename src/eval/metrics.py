@@ -8,12 +8,19 @@ rebuilt from token ids (that would hide <unk>s and normalization changes).
 import torch
 import sacrebleu
 
+from src.inference.beam_search import beam_search
 from src.inference.greedy import greedy_decode, strip_after_eos
 
 
 def translate(model, tokenizer, src_lines, device, batch_size=64, max_len=100,
-              restrict_output=True, max_src_len=None):
-    """Translate raw French lines; returns English strings in the same order."""
+              restrict_output=True, max_src_len=None, beam_size=1, length_penalty=0.6,
+              extra_len=50):
+    """Translate raw French lines; returns English strings in the same order.
+
+    beam_size=1 decodes greedily (up to max_len tokens). beam_size>1 runs beam
+    search with the GNMT length penalty, up to source length + extra_len tokens
+    (capped at max_len), as in the paper (sec. 6.1).
+    """
     allowed = tokenizer.target_token_ids("en") if restrict_output else None
     pad, bos, eos = tokenizer.pad_id, tokenizer.bos_id, tokenizer.eos_id
 
@@ -31,8 +38,12 @@ def translate(model, tokenizer, src_lines, device, batch_size=64, max_len=100,
         idx = order[start:start + batch_size]
         batch = [torch.tensor(encoded[i]) for i in idx]
         src = torch.nn.utils.rnn.pad_sequence(batch, batch_first=True, padding_value=pad).to(device)
-        out = greedy_decode(model, src, bos, eos, max_len=max_len, allowed_ids=allowed)
-        for i, ids in zip(idx, out.tolist()):
+        if beam_size > 1:
+            out = beam_search(model, src, bos, eos, beam_size=beam_size, alpha=length_penalty,
+                              extra_len=extra_len, max_len=max_len, allowed_ids=allowed, pad_id=pad)
+        else:
+            out = greedy_decode(model, src, bos, eos, max_len=max_len, allowed_ids=allowed).tolist()
+        for i, ids in zip(idx, out):
             hyps[i] = tokenizer.decode(strip_after_eos(ids, eos))
     return hyps
 
@@ -47,4 +58,17 @@ def evaluate_bleu(model, tokenizer, src_lines, ref_lines, device, **kwargs):
         "chrf": chrf.score,
         "hypotheses": hyps,
         "references": ref_lines,
+    }
+
+
+def decoding_options(cfg: dict) -> dict:
+    """translate() keyword arguments from a config's `inference:` block.
+
+    Configs without beam settings decode greedily, as before beam search existed.
+    """
+    inf = cfg.get("inference", {})
+    return {
+        "beam_size": inf.get("beam_size", 1),
+        "length_penalty": inf.get("length_penalty", 0.6),
+        "extra_len": inf.get("max_len_extra", 50),
     }

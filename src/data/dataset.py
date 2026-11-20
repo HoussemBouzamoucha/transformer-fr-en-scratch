@@ -55,3 +55,62 @@ def collate_fn(batch, pad_id: int):
     src_padded = torch.nn.utils.rnn.pad_sequence(src_batch, batch_first=True, padding_value=pad_id)
     tgt_padded = torch.nn.utils.rnn.pad_sequence(tgt_batch, batch_first=True, padding_value=pad_id)
     return src_padded, tgt_padded
+
+class TokenBatchSampler(torch.utils.data.Sampler):
+    """Batches of sentence pairs with similar length, ~max_tokens tokens each.
+
+    Vaswani et al. 2017 sec. 5.1: "Sentence pairs were batched together by
+    approximate sequence length. Each training batch contained a set of sentence
+    pairs containing approximately 25000 source tokens and 25000 target tokens."
+    A batch is closed when its padded source or target size would exceed
+    max_tokens; sorting by length keeps that padding small. Pairs of equal length
+    are shuffled and the batch order is shuffled every epoch (call set_epoch).
+    """
+    def __init__(self, lengths, max_tokens: int, shuffle: bool = True, seed: int = 0):
+        """lengths: list of (src_len, tgt_len) per pair, in dataset order."""
+        self.lengths = lengths
+        self.max_tokens = max_tokens
+        self.shuffle = shuffle
+        self.seed = seed
+        self.epoch = 0
+        longest = max(max(s, t) for s, t in lengths)
+        if longest > max_tokens:
+            raise ValueError(f"max_tokens={max_tokens} is smaller than the longest pair ({longest})")
+        self._n_batches = len(self._batches())
+
+    @classmethod
+    def from_dataset(cls, dataset, max_tokens, shuffle=True, seed=0):
+        return cls([(len(s), len(t)) for s, t in dataset.pairs], max_tokens, shuffle, seed)
+
+    def set_epoch(self, epoch: int):
+        self.epoch = epoch
+
+    def _batches(self):
+        g = torch.Generator().manual_seed(self.seed + self.epoch)
+        order = torch.randperm(len(self.lengths), generator=g).tolist() if self.shuffle \
+            else list(range(len(self.lengths)))
+        # Stable sort: equal-length pairs keep the random order from randperm.
+        order.sort(key=lambda i: (self.lengths[i][1], self.lengths[i][0]))
+
+        batches, cur, max_s, max_t = [], [], 0, 0
+        for i in order:
+            s, t = self.lengths[i]
+            new_s, new_t = max(max_s, s), max(max_t, t)
+            if cur and (len(cur) + 1) * max(new_s, new_t) > self.max_tokens:
+                batches.append(cur)
+                cur, new_s, new_t = [], s, t
+            cur.append(i)
+            max_s, max_t = new_s, new_t
+        if cur:
+            batches.append(cur)
+
+        if self.shuffle:
+            perm = torch.randperm(len(batches), generator=g).tolist()
+            batches = [batches[j] for j in perm]
+        return batches
+
+    def __iter__(self):
+        return iter(self._batches())
+
+    def __len__(self):
+        return self._n_batches
