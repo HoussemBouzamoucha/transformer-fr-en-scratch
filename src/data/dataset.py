@@ -25,20 +25,29 @@ class Multi30KDataset(Dataset):
 
         assert len(fr_lines) == len(en_lines), "FR and EN files must have same number of lines"
 
+        # Encoded in big batches (multithreaded C++ for our BPE); same ids as encode().
+        encode_batch = getattr(tokenizer, "encode_batch", None) or (
+            lambda texts, lang: [tokenizer.encode(t, lang=lang) for t in texts])
+        chunk = min(200_000, max_pairs) if max_pairs else 200_000
         self.pairs = []
         skipped = 0
-        for fr, en in zip(fr_lines, en_lines):
+        for start in range(0, len(fr_lines), chunk):
             if max_pairs and len(self.pairs) >= max_pairs:
                 break
+            fr_batch = encode_batch(fr_lines[start:start + chunk], lang="fr")
+            en_batch = encode_batch(en_lines[start:start + chunk], lang="en")
+            for fr, en in zip(fr_batch, en_batch):
+                if max_pairs and len(self.pairs) >= max_pairs:
+                    break
 
-            fr_ids = [self.bos_id] + tokenizer.encode(fr, lang="fr") + [self.eos_id]
-            en_ids = [self.bos_id] + tokenizer.encode(en, lang="en") + [self.eos_id]
+                fr_ids = [self.bos_id] + fr + [self.eos_id]
+                en_ids = [self.bos_id] + en + [self.eos_id]
 
-            if len(fr_ids) > max_len or len(en_ids) > max_len:
-                skipped += 1
-                continue
+                if len(fr_ids) > max_len or len(en_ids) > max_len:
+                    skipped += 1
+                    continue
 
-            self.pairs.append((fr_ids, en_ids))
+                self.pairs.append((fr_ids, en_ids))
 
         print(f"[{split}] {len(self.pairs)} pairs loaded, {skipped} skipped (too long)")
 

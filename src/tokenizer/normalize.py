@@ -22,7 +22,10 @@ _CONTROL = re.compile(r"[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]")
 
 
 def normalize(text: str) -> str:
+    # src/tokenizer/fast_bpe.cpp applies _MAP and _CONTROL itself (read from here);
+    # keep any new step in sync there, tests/test_fast_bpe.py checks it.
     text = unicodedata.normalize("NFC", text)
     text = text.translate(_MAP)
     text = _CONTROL.sub("", text)
     return _SPACES.sub(" ", text).strip()
+

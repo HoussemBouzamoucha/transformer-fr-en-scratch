@@ -1,6 +1,7 @@
 """Build the tokenizer named in the config, behind one small interface.
 
-Both backends expose: encode(text, lang) -> ids (no <s>/</s>), decode(ids),
+Both backends expose: encode(text, lang) -> ids (no <s>/</s>), encode_batch(texts, lang)
+(same ids, many sentences at once, multithreaded), decode(ids),
 pad_id, bos_id, eos_id, vocab_size, target_token_ids(), fingerprint().
 """
 import hashlib
@@ -34,6 +35,9 @@ class SentencePieceTokenizer:
     def encode(self, text: str, lang=None):
         return self.sp.encode(text)
 
+    def encode_batch(self, texts, lang=None):
+        return self.sp.encode(list(texts), num_threads=-1)  # -1: all cores
+
     def decode(self, ids):
         return self.sp.decode(ids)
 
@@ -61,6 +65,9 @@ class HFTokenizer:
 
     def encode(self, text: str, lang=None):
         return self.tok.encode(text, add_special_tokens=False).ids
+
+    def encode_batch(self, texts, lang=None):
+        return [e.ids for e in self.tok.encode_batch(list(texts), add_special_tokens=False)]
 
     def decode(self, ids):
         return self.tok.decode(ids, skip_special_tokens=True)
@@ -93,6 +100,9 @@ class JointBPETokenizer:
 
     def encode(self, text: str, lang=None):
         return self.bpe.encode(text, lang=lang, threshold=self.threshold)
+
+    def encode_batch(self, texts, lang=None):
+        return self.bpe.encode_batch(texts, lang=lang, threshold=self.threshold)
 
     def decode(self, ids):
         return self.bpe.decode(ids)
