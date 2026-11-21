@@ -7,6 +7,7 @@ Refuses to run if the tokenizer doesn't match the one the checkpoint was trained
 with (different vocab file or threshold), because the ids would mean other tokens.
 """
 import argparse
+import json
 import sys
 from pathlib import Path
 
@@ -25,6 +26,7 @@ def main():
     ap.add_argument("--force", action="store_true", help="skip the tokenizer/checkpoint check")
     ap.add_argument("--beam", type=int, default=None, help="beam size (default: inference.beam_size, 1 = greedy)")
     ap.add_argument("--alpha", type=float, default=None, help="length penalty (default: inference.length_penalty)")
+    ap.add_argument("--json", default=None, help="also write the scores and settings to this file")
     args = ap.parse_args()
     sys.stdout.reconfigure(encoding="utf-8")
 
@@ -54,6 +56,16 @@ def main():
           f"BLEU {res['bleu']:.2f} | chrF {res['chrf']:.2f}")
     print(f"  {res['bleu_signature']}")
     print(f"  translations -> {out}")
+    if args.json:
+        Path(args.json).parent.mkdir(parents=True, exist_ok=True)
+        Path(args.json).write_text(json.dumps({
+            "checkpoint": str(ckpt_path), "step": ckpt.get("step"), "split": args.split,
+            "sentences": len(src), "beam_size": dec["beam_size"], "length_penalty": dec["length_penalty"],
+            "restrict_output": not args.no_restrict, "averaged_from": ckpt.get("averaged_from"),
+            "seed": ckpt.get("config", cfg).get("seed"), "tokenizer": ckpt.get("tokenizer"),
+            "bleu": res["bleu"], "chrf": res["chrf"], "signature": res["bleu_signature"],
+        }, indent=2), encoding="utf-8")
+        print(f"  scores -> {args.json}")
     for s, h, r in list(zip(src, res["hypotheses"], ref))[: args.examples]:
         print(f"\nFR  {s}\nOUT {h}\nREF {r}")
 

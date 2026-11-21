@@ -1,6 +1,8 @@
+from pathlib import Path
+
+import numpy as np
 import torch
 from torch.utils.data import Dataset
-from pathlib import Path
 
 
 class Multi30KDataset(Dataset):
@@ -29,34 +31,56 @@ class Multi30KDataset(Dataset):
         encode_batch = getattr(tokenizer, "encode_batch", None) or (
             lambda texts, lang: [tokenizer.encode(t, lang=lang) for t in texts])
         chunk = min(200_000, max_pairs) if max_pairs else 200_000
-        self.pairs = []
+        # Ids are kept as flat int32 arrays + offsets, not lists of Python ints:
+        # ~0.3 GB instead of several GB for 1M pairs, and DataLoader workers
+        # share the arrays instead of slowly copying them.
+        src_parts, tgt_parts, src_lens, tgt_lens = [], [], [], []
         skipped = 0
         for start in range(0, len(fr_lines), chunk):
-            if max_pairs and len(self.pairs) >= max_pairs:
+            if max_pairs and len(src_lens) >= max_pairs:
                 break
             fr_batch = encode_batch(fr_lines[start:start + chunk], lang="fr")
             en_batch = encode_batch(en_lines[start:start + chunk], lang="en")
+            flat_s, flat_t = [], []
             for fr, en in zip(fr_batch, en_batch):
-                if max_pairs and len(self.pairs) >= max_pairs:
+                if max_pairs and len(src_lens) >= max_pairs:
                     break
-
-                fr_ids = [self.bos_id] + fr + [self.eos_id]
-                en_ids = [self.bos_id] + en + [self.eos_id]
-
-                if len(fr_ids) > max_len or len(en_ids) > max_len:
+                if len(fr) + 2 > max_len or len(en) + 2 > max_len:  # + <s> </s>
                     skipped += 1
                     continue
+                flat_s.append(self.bos_id); flat_s.extend(fr); flat_s.append(self.eos_id)
+                flat_t.append(self.bos_id); flat_t.extend(en); flat_t.append(self.eos_id)
+                src_lens.append(len(fr) + 2)
+                tgt_lens.append(len(en) + 2)
+            src_parts.append(np.array(flat_s, dtype=np.int32))
+            tgt_parts.append(np.array(flat_t, dtype=np.int32))
 
-                self.pairs.append((fr_ids, en_ids))
+        self._src = np.concatenate(src_parts) if src_parts else np.zeros(0, dtype=np.int32)
+        self._tgt = np.concatenate(tgt_parts) if tgt_parts else np.zeros(0, dtype=np.int32)
+        self._src_off = np.zeros(len(src_lens) + 1, dtype=np.int64)
+        self._tgt_off = np.zeros(len(tgt_lens) + 1, dtype=np.int64)
+        np.cumsum(src_lens, out=self._src_off[1:])
+        np.cumsum(tgt_lens, out=self._tgt_off[1:])
+        self.lengths = list(zip(src_lens, tgt_lens))  # (src, tgt) with <s> </s>, per pair
 
-        print(f"[{split}] {len(self.pairs)} pairs loaded, {skipped} skipped (too long)")
+        print(f"[{split}] {len(self.lengths)} pairs loaded, {skipped} skipped (too long)")
+
+    @property
+    def pairs(self):
+        """(fr ids, en ids) lists per pair, built on demand (for inspection and tests)."""
+        return [self._pair_lists(i) for i in range(len(self))]
+
+    def _pair_lists(self, i):
+        return (self._src[self._src_off[i]:self._src_off[i + 1]].tolist(),
+                self._tgt[self._tgt_off[i]:self._tgt_off[i + 1]].tolist())
 
     def __len__(self):
-        return len(self.pairs)
+        return len(self.lengths)
 
     def __getitem__(self, idx):
-        fr_ids, en_ids = self.pairs[idx]
-        return torch.tensor(fr_ids, dtype=torch.long), torch.tensor(en_ids, dtype=torch.long)
+        src = self._src[self._src_off[idx]:self._src_off[idx + 1]]
+        tgt = self._tgt[self._tgt_off[idx]:self._tgt_off[idx + 1]]
+        return torch.from_numpy(src.astype(np.int64)), torch.from_numpy(tgt.astype(np.int64))
 
 
 def collate_fn(batch, pad_id: int):
@@ -82,6 +106,7 @@ class TokenBatchSampler(torch.utils.data.Sampler):
         self.shuffle = shuffle
         self.seed = seed
         self.epoch = 0
+        self.skip = 0  # batches to skip at the start of the next epoch (resuming mid-epoch)
         longest = max(max(s, t) for s, t in lengths)
         if longest > max_tokens:
             raise ValueError(f"max_tokens={max_tokens} is smaller than the longest pair ({longest})")
@@ -89,10 +114,12 @@ class TokenBatchSampler(torch.utils.data.Sampler):
 
     @classmethod
     def from_dataset(cls, dataset, max_tokens, shuffle=True, seed=0):
-        return cls([(len(s), len(t)) for s, t in dataset.pairs], max_tokens, shuffle, seed)
+        lengths = getattr(dataset, "lengths", None) or [(len(s), len(t)) for s, t in dataset.pairs]
+        return cls(lengths, max_tokens, shuffle, seed)
 
     def set_epoch(self, epoch: int):
         self.epoch = epoch
+        self.skip = 0  # set it again after this call to resume mid-epoch
 
     def _batches(self):
         g = torch.Generator().manual_seed(self.seed + self.epoch)
@@ -119,7 +146,10 @@ class TokenBatchSampler(torch.utils.data.Sampler):
         return batches
 
     def __iter__(self):
-        return iter(self._batches())
+        # The batch order is a pure function of (seed, epoch), so a resumed run
+        # skips exactly the batches it already trained on in this epoch. skip is
+        # not reset here: a multi-worker DataLoader calls __iter__ twice per epoch.
+        return iter(self._batches()[self.skip:])
 
     def __len__(self):
         return self._n_batches

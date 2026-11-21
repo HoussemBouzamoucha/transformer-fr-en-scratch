@@ -1,0 +1,65 @@
+# Experiment 10: which 32k tokenizer trains the better translator?
+# A small Transformer on WMT14 FR->EN (1M cleaned pairs), trained twice with
+# everything identical except the tokenizer:
+#   10_small_wmt14_own.yaml  our joint BPE (own_bpe_32k_wmt1m_t10.json, threshold 10)
+#   10_small_wmt14_spm.yaml  SentencePiece BPE, M2M-100 settings (m2m100_spmbpe_32k.model)
+# Both vocabs are exactly 32,000, so both models have exactly the same parameters.
+# Run 2 seeds of each (train.py --seed) and compare test BLEU (newstest2014) of
+# the averaged checkpoints with beam search; train_small_tran.py does all of it on Colab.
+#
+# Small, not tiny: d_model 256, 4+4 layers, d_ff 1024 (~15M parameters, about
+# half of them the tied 32k embedding). Pre-LN, so a short budget can't diverge;
+# the architecture is not what this experiment compares.
+seed: 42
+
+data:
+  name: wmt14
+  lang_pair: fr-en
+  data_dir: data/clean/wmt14_1m   # train = 1M cleaned pairs, val = newstest2013, test = newstest2014
+  max_tokens: 100                 # same filter as scripts/tokenizer_report.py (drops ~3% of pairs)
+
+model:
+  d_model: 256
+  n_heads: 4
+  n_encoder_layers: 4
+  n_decoder_layers: 4
+  d_ff: 1024
+  dropout: 0.1
+  max_seq_len: 256
+  shared_vocab: true
+  norm_position: pre
+  pos_encoding: sinusoidal
+
+tokenizer:
+  type: sentencepiece
+  path: data/vocab/m2m100_spmbpe_32k.model
+  vocab_size: 32000
+  # Our normalize() before encoding, like our BPE: the model was trained on
+  # cleaned text, and newstest is raw (« » “ ” ’ would otherwise be <unk>).
+  normalize: true
+
+training:
+  batching: tokens
+  batch_tokens: 8192      # per side, per optimizer step (no accumulation)
+  accum_steps: 1
+  warmup_steps: 4000
+  max_steps: 30000        # ~7 epochs of target tokens; train_small_tran.py can override
+  grad_clip: null
+  label_smoothing: 0.1
+  fp16: true
+  save_every_steps: 1000  # step checkpoints + last.pt for --resume
+  keep_last: 5            # averaged.pt = mean of the last 5
+
+inference:
+  # Off for both tokenizers, so the comparison doesn't depend on our BPE's
+  # English-only output mask (SentencePiece has none).
+  restrict_target_vocab: false
+  beam_size: 4
+  length_penalty: 0.6
+  max_len_extra: 50
+
+logging:
+  backend: tensorboard
+  log_every: 100
+  eval_every_steps: 2000
+  bleu_sentences: 500

@@ -1,4 +1,6 @@
+import argparse
 import json
+import random
 import sys
 import os
 import time
@@ -6,6 +8,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent))
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 
+import numpy as np
 import torch
 from torch.utils.data import DataLoader
 from functools import partial
@@ -21,8 +24,22 @@ from src.eval.metrics import evaluate_bleu
 from src.utils import set_seed, load_config
 
 
-def train(config_path: str):
+def train(config_path: str, seed: int = None, max_steps: int = None, checkpoint_dir: str = None,
+          resume: bool = False):
+    """Train the model a config describes. seed / max_steps / checkpoint_dir override
+    the config (the checkpoints store the config with the overrides applied).
+    resume: continue from <checkpoint_dir>/last.pt if it exists (written every
+    save_every_steps): same weights, optimizer, LR schedule, fp16 scaler, RNG
+    states and position in the epoch, so the run continues where it stopped."""
     cfg = load_config(config_path)
+    if seed is not None:
+        cfg["seed"] = seed
+    if max_steps is not None:
+        cfg["training"]["max_steps"] = max_steps
+    if checkpoint_dir is not None:
+        cfg["training"]["checkpoint_dir"] = str(checkpoint_dir)
+    elif seed is not None and "checkpoint_dir" not in cfg["training"]:
+        cfg["training"]["checkpoint_dir"] = f"checkpoints/{Path(config_path).stem}_seed{seed}"
     set_seed(cfg["seed"])
     tcfg = cfg["training"]
     lcfg = cfg.get("logging", {})
@@ -62,7 +79,11 @@ def train(config_path: str):
     restrict = cfg.get("inference", {}).get("restrict_target_vocab", True)
 
     collate = partial(collate_fn, pad_id=pad_id)
-    loader_kw = dict(collate_fn=collate, num_workers=2, pin_memory=True, prefetch_factor=2)
+    # Own generator: each epoch's DataLoader iterator draws its worker seed from it
+    # instead of the global RNG, so the global RNG (dropout) only advances with
+    # training steps, and a resumed run gets exactly the same dropout masks.
+    loader_kw = dict(collate_fn=collate, num_workers=2, pin_memory=True, prefetch_factor=2,
+                     generator=torch.Generator().manual_seed(cfg["seed"]))
     # batching: sentences = fixed number of pairs per batch (the old default);
     # tokens = length-bucketed batches of ~batch_tokens tokens (paper sec. 5.1).
     batching = tcfg.get("batching", "sentences")
@@ -201,34 +222,84 @@ def train(config_path: str):
         model.train()
         state["eval_seconds"] += time.time() - t_eval
 
-    def after_step(epoch):
+    last_path = ckpt_dir / "last.pt"
+
+    def save_last(epoch, batches_in_epoch):
+        """Everything needed to continue this run exactly (see --resume)."""
+        payload = ckpt_payload(
+            epoch, batches_in_epoch=batches_in_epoch,
+            optimizer_state=optimizer.state_dict(), scaler_state=scaler.state_dict(),
+            scheduler_step=scheduler.step_num, train_state=dict(state),
+            tokens_seen={"src": tokens_seen["src"] + int(run["src"].item()),
+                         "tgt": tokens_seen["tgt"] + int(run["tgt"].item())},
+            elapsed=time.time() - t_start,
+            rng={"python": random.getstate(), "numpy": np.random.get_state(),
+                 "torch": torch.get_rng_state(),
+                 "cuda": torch.cuda.get_rng_state_all() if device.type == "cuda" else None})
+        ckpt_dir.mkdir(parents=True, exist_ok=True)
+        tmp = last_path.with_suffix(".tmp")
+        torch.save(payload, tmp)
+        os.replace(tmp, last_path)  # never leaves a half-written last.pt behind
+
+    def after_step(epoch, batches_in_epoch):
         step = state["step"]
         if save_every and step % save_every == 0:
             t_save = time.time()
             save_step_checkpoint(ckpt_dir, step, ckpt_payload(epoch), keep_last)
+            save_last(epoch, batches_in_epoch)
             state["eval_seconds"] += time.time() - t_save
         if eval_every and step % eval_every == 0:
             evaluate(epoch)
 
     reset_running()
     max_steps = tcfg["max_steps"]
-    epoch = 0
-    for epoch in range(1, 100000):
+    start_epoch, skip = 1, 0
+    if resume and last_path.exists():
+        ck = torch.load(last_path, map_location=device, weights_only=False)
+        model.load_state_dict(ck["model_state"])
+        optimizer.load_state_dict(ck["optimizer_state"])
+        scaler.load_state_dict(ck["scaler_state"])
+        scheduler.step_num = ck["scheduler_step"]
+        state.update(ck["train_state"])
+        tokens_seen.update(ck["tokens_seen"])
+        t_start = time.time() - ck["elapsed"]
+        random.setstate(ck["rng"]["python"])
+        np.random.set_state(ck["rng"]["numpy"])
+        torch.set_rng_state(ck["rng"]["torch"].cpu())
+        if ck["rng"]["cuda"] is not None and device.type == "cuda":
+            torch.cuda.set_rng_state_all([r.cpu() for r in ck["rng"]["cuda"]])
+        start_epoch, skip = ck["epoch"], ck["batches_in_epoch"]
+        if sampler is None and skip:
+            print("Note: sentence batching can't skip to the saved position; "
+                  f"epoch {start_epoch} restarts from its first batch")
+            skip = 0
+        print(f"Resumed from {last_path}: step {state['step']}, epoch {start_epoch}, "
+              f"{skip} batches into it")
+    elif resume:
+        print(f"No {last_path} yet: starting from scratch")
+
+    epoch = start_epoch
+    for epoch in range(start_epoch, 100000):
+        if state["step"] >= max_steps:
+            break
         model.train()
+        seen = skip if epoch == start_epoch else 0  # batches of this epoch already trained on
         if sampler is not None:
             sampler.set_epoch(epoch)
+            sampler.skip = seen
         group = []
         for batch in tqdm(train_loader, desc=f"Epoch {epoch}", disable=bool(eval_every)):
             group.append(batch)
+            seen += 1
             if len(group) == accum:
                 train_step(group)
                 group = []
-                after_step(epoch)
+                after_step(epoch, seen)
                 if state["step"] >= max_steps:
                     break
         if group and state["step"] < max_steps:  # leftover batches at the end of the epoch
             train_step(group)
-            after_step(epoch)
+            after_step(epoch, seen)
 
         if not eval_every:
             evaluate(epoch)
@@ -271,5 +342,14 @@ def train(config_path: str):
 
 
 if __name__ == "__main__":
-    config = sys.argv[1] if len(sys.argv) > 1 else "configs/thin_slice.yaml"
-    train(config)
+    ap = argparse.ArgumentParser(description="Train the Transformer a config describes.")
+    ap.add_argument("config", nargs="?", default="configs/thin_slice.yaml")
+    ap.add_argument("--seed", type=int, default=None, help="override the config's seed")
+    ap.add_argument("--max-steps", type=int, default=None, help="override training.max_steps")
+    ap.add_argument("--checkpoint-dir", default=None,
+                    help="default: training.checkpoint_dir, else checkpoints/<config>[_seed<N>]")
+    ap.add_argument("--resume", action="store_true", help="continue from <checkpoint-dir>/last.pt")
+    a = ap.parse_args()
+    sys.stdout.reconfigure(encoding="utf-8")  # "→" in the log, also on a Windows console/file
+    train(a.config, seed=a.seed, max_steps=a.max_steps, checkpoint_dir=a.checkpoint_dir,
+          resume=a.resume)
