@@ -5,7 +5,7 @@
 #   10_small_wmt14_spm.yaml  SentencePiece BPE, M2M-100 settings (m2m100_spmbpe_32k.model)
 # Both vocabs are exactly 32,000, so both models have exactly the same parameters.
 # Run 2 seeds of each (train.py --seed) and compare test BLEU (newstest2014) of
-# the averaged checkpoints with beam search; train_small_tran.py does all of it on Colab.
+# the averaged checkpoints with beam search; small_transformer.py does all of it on Colab.
 #
 # Small, not tiny: d_model 256, 4+4 layers, d_ff 1024 (~15M parameters, about
 # half of them the tied 32k embedding). Pre-LN, so a short budget can't diverge;
@@ -41,7 +41,7 @@ training:
   batch_tokens: 8192      # per side, per optimizer step (no accumulation)
   accum_steps: 1
   warmup_steps: 4000
-  max_steps: 30000        # ~7 epochs of target tokens; train_small_tran.py can override
+  max_steps: 30000        # ~7 epochs of target tokens; small_transformer.py can override
   grad_clip: null
   label_smoothing: 0.1
   fp16: true
