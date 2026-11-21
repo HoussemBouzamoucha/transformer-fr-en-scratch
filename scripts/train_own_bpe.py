@@ -62,15 +62,17 @@ for lang in ("fr", "en"):
     held[lang] = ([l.strip() for l in open(p, encoding="utf-8")] if p.exists()
                   else corpora[lang][-2000:])[:3000]
 print("\nVocab threshold -> extra tokens per sentence on validation (pick tokenizer.vocab_threshold):")
-base = {lang: sum(len(bpe.encode(l, lang=lang)) for l in lines) for lang, lines in held.items()}
+# encode_batch: the multithreaded C++ encoder (same ids as encode()).
+base_ids = {lang: bpe.encode_batch(lines, lang=lang) for lang, lines in held.items()}
+base = {lang: sum(map(len, ids)) for lang, ids in base_ids.items()}
 print("  threshold    " + "    ".join(f"{lang}" for lang in held))
 for t in (0, 1, 2, 5, 10, 20, 50):
     cells = []
     for lang, lines in held.items():
-        n_tok = sum(len(bpe.encode(l, lang=lang, threshold=t)) for l in lines)
+        n_tok = sum(map(len, bpe.encode_batch(lines, lang=lang, threshold=t)))
         cells.append(f"{100 * (n_tok / base[lang] - 1):+5.1f}%")
     print(f"  {t:>9}    " + "   ".join(cells))
-unk = {lang: sum(bpe.encode(l, lang=lang).count(bpe.unk_id) for l in lines) for lang, lines in held.items()}
+unk = {lang: sum(x.count(bpe.unk_id) for x in ids) for lang, ids in base_ids.items()}
 print(f"  <unk> on validation: {unk}")
 
 print("\nSanity check:")

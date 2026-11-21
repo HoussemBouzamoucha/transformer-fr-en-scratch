@@ -1,0 +1,81 @@
+# Experiment 00: the "base" Transformer of Vaswani et al. 2017 ("Attention Is
+# All You Need"), trained FR -> EN. This is the reference point every later
+# experiment (Pre-LN, RoPE, flash attention, ...) is compared against: copy this
+# file to 01_<change>.yaml and change ONE thing.
+#
+# Faithful to the paper (section in brackets):
+#   architecture  6+6 layers, d_model 512, 8 heads, d_ff 2048, ReLU FFN   [3.1-3.3, Table 3]
+#                 Post-LN: LayerNorm(x + Dropout(Sublayer(x)))             [3.1, 5.4]
+#                 sinusoidal positions, embeddings x sqrt(d_model)         [3.4-3.5]
+#                 shared FR/EN vocab, 3-way embedding/softmax tying        [3.4]
+#   training      Adam(0.9, 0.98, 1e-9), warmup 4000, lr = d^-0.5 min(..) [5.3]
+#                 dropout 0.1 (residual + embeddings), label smoothing 0.1 [5.4]
+#                 no dropout inside the FFN or on attention weights        [5.4]
+#                 length-bucketed batches of ~25k src + 25k tgt tokens     [5.1]
+#                 no gradient clipping (the paper doesn't mention any)
+#                 average the last 5 checkpoints                           [6.1]
+#   decoding      beam 4, length penalty 0.6, max len = input + 50         [6.1]
+#
+# Deviations (and why):
+#   direction     FR -> EN (the paper only reports EN -> FR / EN -> DE)
+#   data          Multi30k (29k pairs) instead of WMT14 EN-FR (36M pairs)
+#   vocab         our joint BPE, 7,256 tokens (threshold 5), not 32k word-pieces
+#   hardware      1 GPU: 4 accumulated batches of 6,250 tokens = one 25k-token
+#                 step of the paper's 8 P100s
+#   steps         see max_steps below (paper: 100k steps on 8 GPUs, 12 h)
+#   precision     fp16 autocast (numerics only, same model)
+#   checkpoints   averaged every 1000 steps instead of every 10 minutes
+seed: 42
+
+data:
+  name: multi30k
+  lang_pair: fr-en
+  max_tokens: 100
+
+model:
+  d_model: 512
+  n_heads: 8
+  n_encoder_layers: 6
+  n_decoder_layers: 6
+  d_ff: 2048
+  dropout: 0.1
+  ffn_dropout: 0.0
+  # Sinusoids have no weights, so this only sizes the table; 256 covers the
+  # longest output beam search allows (100-token input + 50).
+  max_seq_len: 256
+  shared_vocab: true
+  norm_position: post
+  pos_encoding: sinusoidal
+
+tokenizer:
+  type: bpe
+  path: data/vocab/own_bpe_8k_multi30k_t5.json
+  vocab_size: 8000
+  vocab_threshold: 5
+
+training:
+  batching: tokens
+  batch_tokens: 6250
+  accum_steps: 4
+  warmup_steps: 4000
+  # Paper: 100000. Multi30k is ~18 steps per epoch at 25k tokens, so this is
+  # already ~1,100 epochs; best.pt (lowest val loss) is kept alongside averaged.pt.
+  max_steps: 20000
+  grad_clip: null
+  label_smoothing: 0.1
+  fp16: true
+  save_every_steps: 1000
+  keep_last: 5
+
+inference:
+  # The paper lets the decoder emit any token of the shared vocab.
+  restrict_target_vocab: false
+  beam_size: 4
+  length_penalty: 0.6
+  max_len_extra: 50
+
+logging:
+  backend: tensorboard
+  log_every: 100
+  eval_every_steps: 1000
+  bleu_sentences: 500

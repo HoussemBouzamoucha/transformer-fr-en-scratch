@@ -10,8 +10,8 @@ from pathlib import Path
 
 import torch
 
-from src.eval.metrics import translate
-from src.model.transformer import Transformer
+from src.eval.metrics import decoding_options, translate
+from src.model.transformer import build_model
 from src.tokenizer.loader import check_fingerprint, load_tokenizer
 from src.utils import load_config
 
@@ -27,13 +27,10 @@ def load_model(config_path, checkpoint=None, device=None, force=False):
     if not force:
         check_fingerprint(ckpt.get("tokenizer"), tokenizer)
 
+    # The architecture comes from the checkpoint's own config, not the YAML on
+    # disk, so old checkpoints rebuild as they were trained.
     m = ckpt.get("config", cfg)["model"]
-    model = Transformer(
-        vocab_size=tokenizer.vocab_size, d_model=m["d_model"], n_heads=m["n_heads"],
-        n_encoder_layers=m["n_encoder_layers"], n_decoder_layers=m["n_decoder_layers"],
-        d_ff=m["d_ff"], max_len=m["max_seq_len"], dropout=0.0, pad_id=tokenizer.pad_id,
-        tie_embeddings=m.get("shared_vocab", True),
-    ).to(device)
+    model = build_model(m, tokenizer.vocab_size, tokenizer.pad_id, dropout=0.0).to(device)
     model.load_state_dict(ckpt["model_state"])
     model.eval()
     return model, tokenizer, cfg, ckpt, ckpt_path, device
@@ -46,6 +43,7 @@ class Translator:
          self.ckpt_path, self.device) = load_model(config_path, checkpoint, device, force)
         self.max_seq_len = ckpt.get("config", self.cfg)["model"]["max_seq_len"]
         self.restrict_output = restrict_output
+        self.decoding = decoding_options(self.cfg)
         print(f"Loaded {self.ckpt_path} (step {ckpt.get('step')}, val BLEU {ckpt.get('val_bleu')}) "
               f"on {self.device}")
 
@@ -53,7 +51,7 @@ class Translator:
         lines = [text] if isinstance(text, str) else list(text)
         out = translate(self.model, self.tokenizer, lines, self.device, batch_size=batch_size,
                         max_len=self.max_seq_len - 2, max_src_len=self.max_seq_len,
-                        restrict_output=self.restrict_output)
+                        restrict_output=self.restrict_output, **self.decoding)
         return out[0] if isinstance(text, str) else out
 
     def explain(self, text):

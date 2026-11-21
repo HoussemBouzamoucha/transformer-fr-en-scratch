@@ -1,12 +1,14 @@
 """Build the tokenizer named in the config, behind one small interface.
 
-Both backends expose: encode(text, lang) -> ids (no <s>/</s>), decode(ids),
+Both backends expose: encode(text, lang) -> ids (no <s>/</s>), encode_batch(texts, lang)
+(same ids, many sentences at once, multithreaded), decode(ids),
 pad_id, bos_id, eos_id, vocab_size, target_token_ids(), fingerprint().
 """
 import hashlib
 from pathlib import Path
 
 from src.tokenizer.bpe import BPETokenizer
+from src.tokenizer.normalize import normalize as normalize_text
 
 
 def _sha256(path):
@@ -20,9 +22,14 @@ def _sha256(path):
 class SentencePieceTokenizer:
     kind = "sentencepiece"
 
-    def __init__(self, path: str):
+    def __init__(self, path: str, normalize: bool = False):
+        """normalize: run our normalize() (src/tokenizer/normalize.py) before encoding,
+        as JointBPETokenizer does. Needed when the SPM model was trained on cleaned
+        (normalized) text but is fed raw text, e.g. newstest: otherwise the curly
+        quotes, guillemets and dashes it never saw become <unk>."""
         import sentencepiece as spm  # only needed for this backend
         self.path = path
+        self.normalize = bool(normalize)
         self.sp = spm.SentencePieceProcessor()
         self.sp.load(path)
         self.pad_id = self.sp.piece_to_id("<pad>")
@@ -32,7 +39,11 @@ class SentencePieceTokenizer:
         self.threshold = 0
 
     def encode(self, text: str, lang=None):
-        return self.sp.encode(text)
+        return self.sp.encode(normalize_text(text) if self.normalize else text)
+
+    def encode_batch(self, texts, lang=None):
+        texts = [normalize_text(t) for t in texts] if self.normalize else list(texts)
+        return self.sp.encode(texts, num_threads=-1)  # -1: all cores
 
     def decode(self, ids):
         return self.sp.decode(ids)
@@ -42,7 +53,7 @@ class SentencePieceTokenizer:
 
     def fingerprint(self):
         return {"type": self.kind, "path": str(self.path), "sha256": _sha256(self.path),
-                "vocab_size": self.vocab_size}
+                "vocab_size": self.vocab_size, "normalize": self.normalize}
 
 
 class HFTokenizer:
@@ -61,6 +72,9 @@ class HFTokenizer:
 
     def encode(self, text: str, lang=None):
         return self.tok.encode(text, add_special_tokens=False).ids
+
+    def encode_batch(self, texts, lang=None):
+        return [e.ids for e in self.tok.encode_batch(list(texts), add_special_tokens=False)]
 
     def decode(self, ids):
         return self.tok.decode(ids, skip_special_tokens=True)
@@ -94,6 +108,9 @@ class JointBPETokenizer:
     def encode(self, text: str, lang=None):
         return self.bpe.encode(text, lang=lang, threshold=self.threshold)
 
+    def encode_batch(self, texts, lang=None):
+        return self.bpe.encode_batch(texts, lang=lang, threshold=self.threshold)
+
     def decode(self, ids):
         return self.bpe.decode(ids)
 
@@ -115,7 +132,7 @@ def load_tokenizer(cfg: dict):
         return JointBPETokenizer(path, tok_cfg.get("vocab_threshold", 0))
     if kind == "sentencepiece":
         path = tok_cfg.get("path") or cfg["data"].get("sp_model", "data/vocab/spm_8k_wmt.model")
-        return SentencePieceTokenizer(path)
+        return SentencePieceTokenizer(path, normalize=tok_cfg.get("normalize", False))
     if kind == "hf":
         return HFTokenizer(tok_cfg["path"])
     raise ValueError(f"Unknown tokenizer type: {kind!r} (expected 'bpe', 'sentencepiece' or 'hf')")
@@ -129,6 +146,9 @@ def check_fingerprint(saved: dict, tokenizer):
     current = tokenizer.fingerprint()
     bad = [k for k in ("type", "sha256", "vocab_size", "vocab_threshold")
            if saved.get(k) != current.get(k)]
+    # Newer key: only checked when the checkpoint has it (older ones never normalized).
+    if "normalize" in saved and saved["normalize"] != current.get("normalize", False):
+        bad.append("normalize")
     if bad:
         detail = ", ".join(f"{k}: checkpoint={saved.get(k)!r} now={current.get(k)!r}" for k in bad)
         raise ValueError(f"Tokenizer does not match the checkpoint ({detail}).")

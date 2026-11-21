@@ -12,7 +12,9 @@ Pipeline for one sentence:
   -> BPE merges by rank  ->  optional per-language threshold split
 """
 import json
+import os
 import re
+import unicodedata
 from collections import Counter, defaultdict
 from heapq import heapify, heappop, heappush
 
@@ -148,7 +150,105 @@ class BPETokenizer:
 
     def train(self, corpora, vocab_size: int, min_char_count: int = 1, verbose: bool = False,
               fit_threshold=None):
-        """Learn joint merges.
+        """Learn joint merges (see _train_python for the algorithm and arguments).
+
+        Runs in C++ (src/tokenizer/fast_bpe.cpp: piece counting and vocab fitting
+        multithreaded, the merge loop on one core) when a compiler is available,
+        else in Python. Both write the same vocab file, byte for byte
+        (tests/test_fast_bpe.py); BPE_FAST=0 forces Python."""
+        from src.tokenizer.fast_bpe import get_trainer
+        trainer = get_trainer(self)
+        if trainer is None:
+            return self._train_python(corpora, vocab_size, min_char_count, verbose, fit_threshold)
+        return self._train_fast(trainer, corpora, vocab_size, min_char_count, verbose, fit_threshold)
+
+    def _train_fast(self, ft, corpora, vocab_size, min_char_count, verbose, fit_threshold):
+        """_train_python, step for step, with the heavy parts in C++ (FastTrainer)."""
+        if not isinstance(corpora, dict):
+            corpora = {None: list(corpora)}
+        self.min_char_count = min_char_count
+        threads = os.cpu_count() or 1
+
+        langs = list(corpora)
+        for slot, lines in enumerate(corpora.values()):
+            ft.count_text(slot, self._join_lines(list(lines)), langs[slot], self.normalize, threads)
+
+        char_counts = ft.char_counts()
+        rare = {ch for ch, c in char_counts.items() if c < min_char_count and ch not in ALWAYS_KEEP}
+        symbols = set(char_counts) | ({self.EOW} if char_counts else set())
+
+        self.vocab = {tok: i for i, tok in enumerate(self.special_tokens)}
+        self.base_tokens = (symbols - rare) | (ALWAYS_KEEP - {" "})
+        for sym in sorted(self.base_tokens):
+            self.vocab.setdefault(sym, len(self.vocab))
+
+        n_new_max = vocab_size - len(self.vocab) if fit_threshold is None else 4 * vocab_size
+        a_ids, b_ids, _, counts = ft.merge(rare, ft.intern(self.EOW), n_new_max)
+        S = ft.syms()
+        self.merges, self.split_of = [(S[a], S[b]) for a, b in zip(a_ids, b_ids)], {}
+        new_tokens = []
+        for i, (pair, count) in enumerate(zip(self.merges, counts), 1):
+            merged = pair[0] + pair[1]
+            if merged not in self.split_of:
+                self.split_of[merged] = pair
+                new_tokens.append(merged)
+            if verbose and i % 500 == 0:
+                print(f"  merge {i}: {pair} -> {merged!r} (count={count})")
+
+        fit_slots = [slot for slot, lang in enumerate(langs) if lang is not None]
+        fit_langs = [langs[slot] for slot in fit_slots]
+
+        def lang_counts():
+            S = ft.syms()
+            out = {}
+            for i, lang in enumerate(fit_langs):
+                ids, vals = ft.counts(i)
+                out[lang] = dict(zip((S[t] for t in ids), vals))
+            return out
+
+        if fit_threshold is None:
+            kept, self.lang_counts = set(new_tokens), None
+        else:
+            base_ids = [ft.intern(t) for t in self.base_tokens]
+            k = ft.fit(fit_slots, base_ids, vocab_size, len(self.vocab), fit_threshold, threads)
+            S = ft.syms()
+            kept = {S[t] for t in ft.kept()}
+            self.lang_counts = lang_counts()
+            short = len(self.vocab) + len(kept) < vocab_size
+            print(f"Fitted vocab (threshold {fit_threshold}): first {k:,} of {len(self.merges):,} merges"
+                  + (f"; ran out of merges, vocab is {len(self.vocab) + len(kept):,}, not {vocab_size:,}"
+                     if short else ""))
+            self.merges = self.merges[:k]
+            self.split_of = {}
+            for a, b in self.merges:
+                self.split_of.setdefault(a + b, (a, b))
+        for tok in new_tokens:
+            if tok in kept:
+                self.vocab[tok] = len(self.vocab)
+        self.fit_threshold = fit_threshold
+        self._finalize()
+
+        # Per-language token counts under the final segmentation.
+        if self.lang_counts is None:
+            ft.count_vocab(fit_slots, [ft.intern(t) for t in self.vocab], threads)
+            self.lang_counts = lang_counts()
+
+        print(f"Training done. Vocab size: {len(self.vocab)}, merges: {len(self.merges)}, "
+              f"rare chars -> <unk>: {len(rare)}")
+
+    def _join_lines(self, texts):
+        """Sentences -> one "\\n"-joined string for C++, NFC applied when normalizing
+        (the rest of normalize() is done in C++)."""
+        lines = "\n".join(texts)
+        if lines.count("\n") != len(texts) - 1:  # "\n" inside a sentence is just a space
+            lines = "\n".join(t.replace("\n", " ") for t in texts)
+        if self.normalize and not unicodedata.is_normalized("NFC", lines):
+            lines = unicodedata.normalize("NFC", lines)
+        return lines
+
+    def _train_python(self, corpora, vocab_size: int, min_char_count: int = 1, verbose: bool = False,
+                      fit_threshold=None):
+        """Learn joint merges. The pure-Python reference the C++ trainer must match.
 
         corpora: {"fr": [lines], "en": [lines]} (or a plain list of lines, which
         trains without per-language counts).
@@ -342,6 +442,7 @@ class BPETokenizer:
         self.merge_ranks = {pair: r for r, pair in enumerate(self.merges)}
         self.id_to_token = {i: t for t, i in self.vocab.items()}
         self._cache = {}
+        self._fast = None  # C++ encoder tables, rebuilt on the next encode_batch()
 
     # ------------------------------------------------------------- encoding
     def _segment(self, piece, ranks=None):
@@ -373,7 +474,15 @@ class BPETokenizer:
     def _allowed(self, lang, threshold):
         if lang is None or threshold <= 0 or lang not in self.lang_counts:
             return None
-        return {t for t, c in self.lang_counts[lang].items() if c >= threshold}
+        # Built once per (lang, threshold): rebuilding it on every encode() call
+        # made threshold encoding ~10x slower. Reset when lang_counts is replaced.
+        memo = self.__dict__.get("_allowed_memo")
+        if memo is None or memo[0] is not self.lang_counts:
+            memo = self._allowed_memo = (self.lang_counts, {})
+        key = (lang, threshold)
+        if key not in memo[1]:
+            memo[1][key] = frozenset(t for t, c in self.lang_counts[lang].items() if c >= threshold)
+        return memo[1][key]
 
     def _split(self, tok, vocab, allowed=None):
         """Undo merges until every piece has a vocab slot and, when `allowed` is
@@ -405,6 +514,27 @@ class BPETokenizer:
             ids = [self.bos_id] + ids + [self.eos_id]
         return ids
 
+    def encode_batch(self, texts, lang=None, threshold: int = 0, add_special: bool = False,
+                     num_threads: int = None):
+        """encode() for many sentences at once, in C++ on all CPU cores
+        (src/tokenizer/fast_bpe.cpp). Same ids as encode(); falls back to it when
+        no C++ compiler is available. Pass big batches: the per-call cost is fixed."""
+        texts = list(texts)
+        if not texts:
+            return []
+        if self.__dict__.get("_fast") is None:
+            from src.tokenizer.fast_bpe import get_encoder
+            self._fast = get_encoder(self) or False
+        if self._fast is False:
+            return [self.encode(t, lang, threshold, add_special) for t in texts]
+
+        lines = self._join_lines(texts)
+        out = self._fast.encode(lines, len(texts), lang, self._allowed(lang, threshold),
+                                self.normalize, num_threads)
+        if add_special:
+            out = [[self.bos_id] + ids + [self.eos_id] for ids in out]
+        return out
+
     def decode(self, ids):
         skip = {self.pad_id, self.bos_id, self.eos_id}
         text = "".join(self.id_to_token.get(i, "<unk>") for i in ids if i not in skip)
@@ -425,6 +555,9 @@ class BPETokenizer:
         return sorted(ids)
 
     # ---------------------------------------------------------- persistence
+    def __getstate__(self):  # the C++ handle can't be pickled; rebuilt on demand
+        return {**self.__dict__, "_fast": None}
+
     def save(self, path: str):
         data = {
             "version": 3,

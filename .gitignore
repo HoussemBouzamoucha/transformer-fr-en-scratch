@@ -21,6 +21,7 @@ notebooks/.ipynb_checkpoints/
 .vscode/
 
 # CUDA build artifacts
+src/tokenizer/_build/
 *.o
 *.so
 *.ptx
