@@ -1,5 +1,5 @@
 # Small Transformer, trained once per tokenizer: which 32k tokenizer translates better?
-# Colab cells 8-11, to paste UNDER cells 1-7 of colab.py (same notebook).
+# Colab cells 8-12, to paste UNDER cells 1-7 of colab.py (same notebook).
 #
 # Before Cell 8: Runtime -> Change runtime type -> T4 GPU. That starts a fresh
 # machine, so Cell 8 restores everything from Drive; cells 1-7 don't need to run again.
@@ -15,7 +15,8 @@
 # Everything goes to Drive: MyDrive/transformer-fr-en/wmt14_1m_32k_cpp/small_transformer/
 #   <tok>_seed<N>/  checkpoints, last.pt (resume point), train.log, train_summary.json,
 #                   test.hyp.en, test_beam4.json
-#   results.md / results.json   the final table
+#   results.md / results.json         BLEU / chrF per run (Cell 11)
+#   comparison.md / comparison.json   every metric, side by side, with significance (Cell 12)
 # Colab disconnected? Run Cell 8, then Cell 10 again: each run continues from its
 # last.pt (saved every 1,000 steps) with the same weights, optimizer, LR schedule,
 # RNG and position in the epoch; finished runs are skipped.
@@ -142,4 +143,171 @@ print(table)
 (RUNS / "results.md").write_text(table + "\n", encoding="utf-8")
 (RUNS / "results.json").write_text(json.dumps(rows, indent=2), encoding="utf-8")
 print(f"\nsaved {RUNS / 'results.md'} and results.json")
+
+
+# %% Cell 12: own BPE vs SentencePiece on every metric  (~2 min, after Cell 11)
+# Uses the translations Cell 11 saved (test.hyp.en); nothing is retrained or re-decoded.
+#   Translation quality  BLEU, chrF, chrF++, TER (lower is better), output/reference length
+#   By sentence length   BLEU on short / medium / long source sentences
+#   Output problems      unknown tokens in the output, looping repeats, empty outputs
+#   Training             val loss per English WORD (per-token losses aren't comparable
+#                        across tokenizers, so it's converted with each one's token count),
+#                        speed, time to the best checkpoint
+#   Significance         paired bootstrap on BLEU (1,000 resamples) for each seed pair:
+#                        95% interval of the difference and a p-value
+import statistics
+import numpy as np
+from collections import Counter
+from sacrebleu.metrics import BLEU, CHRF, TER
+from src.tokenizer.loader import load_tokenizer
+from src.utils import load_config
+
+src = [l.strip() for l in open(CLEAN / "test.fr", encoding="utf-8")]
+refs = [l.strip() for l in open(CLEAN / "test.en", encoding="utf-8")]
+val_fr = [l.strip() for l in open(CLEAN / "val.fr", encoding="utf-8")]
+val_en = [l.strip() for l in open(CLEAN / "val.en", encoding="utf-8")]
+BUCKETS = [("short (1-15 words)", 1, 15), ("medium (16-30)", 16, 30), ("long (31+)", 31, 10**9)]
+src_len = [len(s.split()) for s in src]
+
+def val_tokens_and_words(cfg):
+    """Target tokens the val loss was averaged over (pairs kept by max_tokens, </s> included)
+    and the English words in those same pairs."""
+    c = load_config(cfg)
+    tk = load_tokenizer(c)
+    fr, en = tk.encode_batch(val_fr, lang="fr"), tk.encode_batch(val_en, lang="en")
+    keep = [i for i in range(len(en)) if len(fr[i]) + 2 <= c["data"]["max_tokens"]
+            and len(en[i]) + 2 <= c["data"]["max_tokens"]]
+    return sum(len(en[i]) + 1 for i in keep), sum(len(val_en[i].split()) for i in keep)
+
+VAL = {tok: val_tokens_and_words(cfg) for tok, cfg in TOKS.items()}
+
+def repeats(h):  # a word 4-gram 3+ times in one output = the decoder looping
+    w = h.split()
+    return any(c >= 3 for c in Counter(zip(w, w[1:], w[2:], w[3:])).values())
+
+def measure(tok, seed):
+    run = RUNS / f"{tok}_seed{seed}"
+    if not (run / "test.hyp.en").exists():
+        return None
+    hyps = (run / "test.hyp.en").read_text(encoding="utf-8").split("\n")[:len(refs)]
+    t = json.loads((run / "train_summary.json").read_text())
+    bleu = BLEU().corpus_score(hyps, [refs])
+    m = {"bleu": bleu.score, "chrf": CHRF().corpus_score(hyps, [refs]).score,
+         "chrf_pp": CHRF(word_order=2).corpus_score(hyps, [refs]).score,
+         "ter": TER().corpus_score(hyps, [refs]).score,
+         "len_ratio": bleu.sys_len / bleu.ref_len}
+    for name, lo, hi in BUCKETS:
+        idx = [i for i, n in enumerate(src_len) if lo <= n <= hi]
+        m[name] = BLEU().corpus_score([hyps[i] for i in idx], [[refs[i] for i in idx]]).score
+    words = sum(len(h.split()) for h in hyps) or 1
+    m["unk_out"] = 1000 * sum(h.count("<unk>") + h.count("⁇") for h in hyps) / words
+    m["repeat"] = 100 * sum(map(repeats, hyps)) / len(hyps)
+    m["empty"] = sum(not h.strip() for h in hyps)
+    tokens, vwords = VAL[tok]
+    m["val_per_word"] = t["best_val_loss"] * tokens / vwords
+    m["steps_per_s"] = t["steps_per_second"]
+    m["train_h"] = t["train_seconds"] / 3600
+    m["best_step"] = t.get("best_step")
+    m["_hyps"] = hyps
+    return m
+
+M = {(tok, seed): measure(tok, seed) for seed in SEEDS for tok in TOKS}
+M = {k: v for k, v in M.items() if v}
+done = sorted({s for (_, s) in M if (("own", s) in M and ("spm", s) in M)})
+if not done:
+    raise RuntimeError("No seed has finished runs for both tokenizers yet (run Cells 10 and 11 first)")
+
+ROWS = [  # key, label, format, better ("high" / "low" / None)
+    ("Translation quality (newstest2014)", None, None, None),
+    ("bleu", "BLEU", "{:.2f}", "high"),
+    ("chrf", "chrF", "{:.2f}", "high"),
+    ("chrf_pp", "chrF++", "{:.2f}", "high"),
+    ("ter", "TER (lower is better)", "{:.2f}", "low"),
+    ("len_ratio", "output / reference length", "{:.3f}", None),
+    ("BLEU by source length", None, None, None),
+    *[(name, name, "{:.2f}", "high") for name, _, _ in BUCKETS],
+    ("Output problems", None, None, None),
+    ("unk_out", "unknown tokens per 1k output words", "{:.2f}", "low"),
+    ("repeat", "outputs looping (4-gram 3x) %", "{:.2f}", "low"),
+    ("empty", "empty outputs", "{:.0f}", "low"),
+    ("Training", None, None, None),
+    ("val_per_word", "best val loss per English word (nats)", "{:.4f}", "low"),
+    ("steps_per_s", "steps / s", "{:.2f}", "high"),
+    ("train_h", "training time (h)", "{:.2f}", "low"),
+    ("best_step", "step of best val loss", "{:,.0f}", None),
+]
+
+def mean_of(tok, key):
+    return statistics.mean(M[(tok, s)][key] for s in done)
+
+def better_of(a, b, better):
+    if better is None or a == b:
+        return "" if better is None else "tie"
+    return "own BPE" if (a > b) == (better == "high") else "SentencePiece"
+
+seeds_txt = ", ".join(map(str, done))
+out = [f"# Own BPE vs SentencePiece: small Transformer, WMT14 FR->EN (seeds {seeds_txt})", "",
+       "| metric | own BPE | SentencePiece | own − SPM | better | per seed (own / SPM) |",
+       "|---|---|---|---|---|---|"]
+wins = Counter()
+for key, label, fmt, better in ROWS:
+    if label is None:
+        out.append(f"| **{key}** | | | | | |")
+        continue
+    a, b = mean_of("own", key), mean_of("spm", key)
+    w = better_of(a, b, better)
+    if w in ("own BPE", "SentencePiece"):
+        wins[w] += 1
+    per_seed = "; ".join(f"s{s}: {fmt.format(M[('own', s)][key])} / {fmt.format(M[('spm', s)][key])}" for s in done)
+    out.append(f"| {label} | {fmt.format(a)} | {fmt.format(b)} | {a - b:+.3f} | {w} | {per_seed} |")
+
+# Paired bootstrap on BLEU, own vs SPM of the same seed (same 3,003 sentences).
+bleu = BLEU()
+out += ["", "## Is the BLEU difference real? (paired bootstrap, 1,000 resamples)", "",
+        "| seed | own BLEU | SPM BLEU | own − SPM | 95% interval | p-value |", "|---|---|---|---|---|---|"]
+rng = np.random.default_rng(12345)
+significant = []
+for s in done:
+    ho, hs = M[("own", s)]["_hyps"], M[("spm", s)]["_hyps"]
+    try:  # sentence-level BLEU statistics, then resample sums (how sacreBLEU's own test works)
+        so = np.array(bleu._extract_corpus_statistics(ho, [refs]))
+        ss = np.array(bleu._extract_corpus_statistics(hs, [refs]))
+        idx = rng.integers(0, len(refs), (1000, len(refs)))
+        diffs = np.array([bleu._compute_score_from_stats(so[i].sum(0).tolist()).score
+                          - bleu._compute_score_from_stats(ss[i].sum(0).tolist()).score for i in idx])
+    except AttributeError:  # older/newer sacreBLEU without those helpers: slower, 200 resamples
+        diffs = []
+        for _ in range(200):
+            i = rng.integers(0, len(refs), len(refs))
+            diffs.append(bleu.corpus_score([ho[k] for k in i], [[refs[k] for k in i]]).score
+                         - bleu.corpus_score([hs[k] for k in i], [[refs[k] for k in i]]).score)
+        diffs = np.array(diffs)
+    d = M[("own", s)]["bleu"] - M[("spm", s)]["bleu"]
+    lo, hi = np.percentile(diffs, [2.5, 97.5])
+    p = (np.sum(diffs <= 0) + 1) / (len(diffs) + 1) if d > 0 else (np.sum(diffs >= 0) + 1) / (len(diffs) + 1)
+    significant.append(p < 0.05)
+    out.append(f"| {s} | {M[('own', s)]['bleu']:.2f} | {M[('spm', s)]['bleu']:.2f} | {d:+.2f} | "
+               f"[{lo:+.2f}, {hi:+.2f}] | {p:.3f} |")
+
+mean_d = statistics.mean(M[("own", s)]["bleu"] - M[("spm", s)]["bleu"] for s in done)
+leader = "own BPE" if mean_d > 0 else "SentencePiece"
+if all(significant) and len({np.sign(M[('own', s)]['bleu'] - M[('spm', s)]['bleu']) for s in done}) == 1:
+    verdict = f"{leader} is better: +{abs(mean_d):.2f} BLEU on average, significant (p < 0.05) for every seed."
+elif any(significant):
+    verdict = (f"{leader} leads by {abs(mean_d):.2f} BLEU on average, but it is not significant for every "
+               "seed: a small or seed-dependent difference.")
+else:
+    verdict = (f"No significant difference ({leader} +{abs(mean_d):.2f} BLEU on average, within noise). "
+               "Tie-breakers: <unk> rate and encoding speed (see report.txt).")
+out += ["", f"Metrics won (means over seeds): {dict(wins)}", "", f"**Verdict:** {verdict}", "",
+        "newstest2014 (3,003 sentences), averaged last 5 checkpoints, beam 4, length penalty 0.6, "
+        "no output restriction; sacreBLEU defaults (13a)."]
+
+table = "\n".join(out)
+print(table)
+(RUNS / "comparison.md").write_text(table + "\n", encoding="utf-8")
+(RUNS / "comparison.json").write_text(json.dumps(
+    {f"{tok}_seed{s}": {k: v for k, v in m.items() if k != "_hyps"} for (tok, s), m in M.items()}
+    | {"verdict": verdict, "seeds_compared": done}, indent=2), encoding="utf-8")
+print(f"\nsaved {RUNS / 'comparison.md'} and comparison.json")
 drive.flush_and_unmount()   # make sure everything is on Drive; Cell 8 mounts it again
